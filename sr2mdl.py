@@ -725,6 +725,14 @@ class SR2MDL:
 
             self.nodes.append(node)
 
+            # The topmost node in the hierarchy has neither a parent nor a child
+            # relation. Some files contain bytes between the last real node's data
+            # and the node array that aren't accounted for by the size bookkeeping
+            # below, so bytes_left is not guaranteed to reach exactly 0 once this
+            # node is processed. Stop here instead of reading past the real data.
+            is_last_node = (node.relation["Parent Offset"] == 0
+                             and node.relation["Child Offset"] == 0)
+
             # Go back through the file
             current_node_relation_offset -= node_size
             bytes_left -= node_size
@@ -732,6 +740,8 @@ class SR2MDL:
             # Doesn't have mesh attached or something?
             # Still needs to be included or else the game crashes
             if node_size == 0x20:
+                if is_last_node:
+                    break
                 continue
 
             """
@@ -744,6 +754,8 @@ class SR2MDL:
             if ((node.relation["unk_0x08"] == 1)
                     and node.transform["unk_0x2C"] == 0x00
                     and node.transform["Rotation X"] == 0x00):
+                if is_last_node:
+                    break
                 continue
 
             # Unpack mesh
@@ -772,6 +784,9 @@ class SR2MDL:
                 bytes_left -= some_data_size
 
             print("Total bytes left after substraction: {}".format(bytes_left))
+
+            if is_last_node:
+                break
 
         self.find_node_index_relations_by_node_relation_offsets()
 
