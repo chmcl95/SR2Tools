@@ -14,6 +14,19 @@ def fill_dict_from_bytes_by_formatting(dictionary_to_fill: dict, source_bytes: b
     return dictionary_to_fill
 
 
+def node_has_mesh_data(model_file_bytes: bytes, model_pointers_offset: int) -> bool:
+    """
+    Whether a node's Model Pointers actually describe a mesh.
+
+    A node's "unk_0x0C" being NaN does NOT reliably mean the node has no
+    mesh - some real meshes (e.g. small 4-vertex quad props/lights) have
+    it set to NaN too. The reliable signal is the Model Pointers'
+    "Vertex Offset" field, which is 0x00 or 0xFFFFFF when there is no mesh.
+    """
+    vertex_offset = struct.unpack_from('<I', model_file_bytes, model_pointers_offset)[0]
+    return vertex_offset != 0x00 and vertex_offset != 0xffffff
+
+
 
 SR2MDL_file_header_dict = {
     "File Size": 0,
@@ -725,7 +738,7 @@ class SR2MDL:
 
             print("unk 0x0C value {0}".format(node.transform["unk_0x0C"]))
 
-            if math.isnan(node.transform["unk_0x0C"]):
+            if not node_has_mesh_data(model_file_bytes, node.transform["Model Pointers Offset"]):
                 print("Node without Mesh detected")
                 mesh_present = False
 
@@ -1015,10 +1028,17 @@ def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
         flipped_uv = [ vertex.uv[0], flipped_v ]
         uvs.append(flipped_uv)
 
-    for face_index in range(0, len(model_mesh.faces), 3):
-        v0 = bl_vertex_array[model_mesh.faces[face_index]]
-        v1 = bl_vertex_array[model_mesh.faces[face_index + 1]]
-        v2 = bl_vertex_array[model_mesh.faces[face_index + 2]]
+    # Some meshes (e.g. small 4-vertex quad "dummy" props/lights) store fewer
+    # than 2 face indices in the file - not enough to form even one triangle.
+    # Assume the standard quad winding used by these meshes elsewhere.
+    face_indices = model_mesh.faces
+    if len(face_indices) < 2 and len(model_mesh.vertexes) >= 4:
+        face_indices = [0, 1, 2, 2, 1, 3]
+
+    for face_index in range(0, len(face_indices), 3):
+        v0 = bl_vertex_array[face_indices[face_index]]
+        v1 = bl_vertex_array[face_indices[face_index + 1]]
+        v2 = bl_vertex_array[face_indices[face_index + 2]]
         temp_blender_mesh.faces.new((v0, v1, v2))
 
     # Transfer all the data to bl_mesh attached to bl_obj
