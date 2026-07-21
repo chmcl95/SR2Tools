@@ -427,6 +427,9 @@ class SR2Node:
         self.relation = {}
         self.some_data = {}
 
+        # Mesh belonging to this node, if any (set during unpack; not serialized)
+        self.mesh = None
+
         self.mesh_offset = 0x00
         self.draw_ops_offset = 0x00
 
@@ -671,6 +674,7 @@ class SR2MDL:
 
         new_mesh.unpack_from_bytes(model_file_bytes, new_node.transform["Model Pointers Offset"])
 
+        new_node.mesh = new_mesh
         self.meshes.append(new_mesh)
 
     def unpack_from_bytes(self, model_file_bytes):
@@ -775,6 +779,7 @@ class SR2MDL:
 
                 bytes_left -= mesh.total_size
 
+                node.mesh = mesh
                 self.meshes.append(mesh)
 
                 print("Mesh at {0:#X}".format(current_node_relation_offset))
@@ -883,12 +888,13 @@ class SR2MDL:
             current_mesh_offset += mesh.total_size
 
     def update_node_offset_to_model_pointers(self):
-        for node_index in range(len(self.nodes)):
-            node = self.nodes[node_index]
-
+        # Nodes without a mesh can appear anywhere in the list, not just at the
+        # end, so self.meshes can't be indexed positionally by node_index -
+        # use the node<->mesh association instead.
+        for node in self.nodes:
             print("Transform", node.transform["unk_0x0C"], float('-nan'))
-            if not math.isnan(node.transform["unk_0x0C"]):
-                mesh = self.meshes[node_index]
+            if node.mesh is not None:
+                mesh = node.mesh
 
                 node.transform["Model Pointers Offset"] = (mesh.offset + mesh.sizes["Material"]
                                                            + mesh.sizes["Vertex"] + mesh.sizes["Face"])
@@ -1092,17 +1098,21 @@ def load(filepath: str, global_matrix: mathutils.Matrix):
     model_collection["SR2MDL file header"] = SR2_model.file_header
 
     # Turn every node into a blender object and attach mesh to it, if present
+    # (nodes without a mesh can appear anywhere in the list, not just at the
+    # end, so the node<->mesh association set during unpack must be used
+    # instead of comparing indexes against len(SR2_model.meshes))
     for index, node in enumerate(SR2_model.nodes):
-        if index < len(SR2_model.meshes):
-            mdl_mesh = SR2_model.meshes[index]
-            generate_mesh(node, mdl_mesh, index, global_matrix, model_collection)
+        if node.mesh is not None:
+            generate_mesh(node, node.mesh, index, global_matrix, model_collection)
         else:
             node_name = 'node_{0:04}'.format(index)
             bl_obj = bpy.data.objects.new(node_name, None)
 
+            # Every unpacked node has a transform, even without a mesh/some_data
+            bl_obj["Node Transform"] = node.transform
+            bl_obj["Extra"] = node.extra
+
             if node.some_data != {}:
-                bl_obj["Node Transform"] = node.transform
-                bl_obj["Extra"] = node.extra
                 bl_obj["Some Data"] = node.some_data
 
             bl_obj["Node Relation"] = node.relation
@@ -1236,6 +1246,7 @@ def save(output_folder_path: str):
 
                 SR2_mesh.draw_options = bl_object["Draw Options"]
 
+                new_node.mesh = SR2_mesh
                 SR2_model.meshes.append(SR2_mesh)
 
         output_file_path = output_folder_path + sr2_collection.name + ".mdl"
