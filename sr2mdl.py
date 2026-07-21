@@ -549,8 +549,15 @@ class SR2MDL:
         single_index_size = 4
         node_indexes_count = node_indexes_size // single_index_size
 
+        # "Node Indexes Size In Bytes" is not always a multiple of 4 (seen in
+        # RIVIERA.DAT: 0x9E = 158 bytes), so only slice the bytes that make up
+        # whole indexes here; unpack_level_model_from_bytes still advances to
+        # the next section by the raw header value, since that's the real
+        # physical stride and any trailing bytes are just unparsed padding.
+        aligned_size = node_indexes_count * single_index_size
+
         node_indexes_bytes = model_file_bytes[offset:
-                                              offset + node_indexes_size]
+                                              offset + aligned_size]
 
         node_indexes_formated = self.node_indexes_format.format(node_indexes_count)
 
