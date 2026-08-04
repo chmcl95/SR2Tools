@@ -36,6 +36,13 @@ def node_has_mesh_data(model_file_bytes: bytes, model_pointers_offset: int) -> b
     it set to NaN too. The reliable signal is the Model Pointers'
     "Vertex Offset" field, which is 0x00 or 0xFFFFFF when there is no mesh.
     """
+    # Offset 0x00 is the file header, so it can never hold Model Pointers.
+    # An offset past the end of the file means the node is not pointing at
+    # anything usable either, which happens with mesh-less nodes of a file
+    # that was re-exported after the model was made smaller.
+    if model_pointers_offset <= 0 or model_pointers_offset + 0x20 > len(model_file_bytes):
+        return False
+
     vertex_offset = struct.unpack_from('<I', model_file_bytes, model_pointers_offset)[0]
     return vertex_offset != 0x00 and vertex_offset != 0xffffff
 
@@ -419,6 +426,11 @@ class SomeData:
 
         some_data_bytes = data_bytes[offset:
                                      offset + 0x20]
+
+        # Same as in node_has_mesh_data - the offset can point outside the file
+        if len(some_data_bytes) < 0x20:
+            print("!!! Some Data at {0:#X} is outside the file, skipping it !!!".format(offset))
+            return
 
         self.data = fill_dict_from_bytes_by_formatting(self.data,
                                                        some_data_bytes,
@@ -1048,10 +1060,23 @@ def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
     if len(face_indices) < 2 and len(model_mesh.vertexes) >= 4:
         face_indices = [0, 1, 2, 2, 1, 3]
 
-    for face_index in range(0, len(face_indices), 3):
-        v0 = bl_vertex_array[face_indices[face_index]]
-        v1 = bl_vertex_array[face_indices[face_index + 1]]
-        v2 = bl_vertex_array[face_indices[face_index + 2]]
+    # Stop at the last complete triangle. A file written by a tool that did not
+    # triangulate its faces can leave a partial one at the end, and dropping it
+    # is better than failing the whole import.
+    if len(face_indices) % 3 != 0:
+        print("!!! Face index count {} is not a multiple of 3, ignoring the trailing {} "
+              "index(es) !!!".format(len(face_indices), len(face_indices) % 3))
+
+    for face_index in range(0, len(face_indices) - 2, 3):
+        triangle_indices = face_indices[face_index:face_index + 3]
+
+        if max(triangle_indices) >= len(bl_vertex_array):
+            print("!!! Face {} refers to a vertex outside the mesh, skipping it !!!".format(triangle_indices))
+            continue
+
+        v0 = bl_vertex_array[triangle_indices[0]]
+        v1 = bl_vertex_array[triangle_indices[1]]
+        v2 = bl_vertex_array[triangle_indices[2]]
         temp_blender_mesh.faces.new((v0, v1, v2))
 
     # Transfer all the data to bl_mesh attached to bl_obj
@@ -1228,6 +1253,24 @@ def getOriginalNormals(blender_mesh):
     return [flat_normals[i:i + 3] for i in range(0, len(flat_normals), 3)]
 
 
+def convertBlenderFacesToSR2Faces(blender_mesh):
+    """
+    Flat array of triangle vertex indices.
+
+    A MDL only stores triangles, so any quad or n-gon the user made has to be
+    split up first - writing its indices as they are shifts every following
+    triangle and corrupts the file. Blender maintains a triangulated view of
+    the mesh for exactly this purpose.
+    """
+    blender_mesh.calc_loop_triangles()
+
+    faces = []
+    for triangle in blender_mesh.loop_triangles:
+        faces.extend(triangle.vertices)
+
+    return faces
+
+
 def convertBlenderVertexesToSR2Vertexes(blender_mesh):
     vertexes = []
 
@@ -1347,13 +1390,18 @@ def save(output_folder_path: str):
                 SR2_mesh.material = bl_object["Material"]
 
                 SR2_mesh.vertexes = convertBlenderVertexesToSR2Vertexes(blender_mesh)
+                SR2_mesh.faces = convertBlenderFacesToSR2Faces(blender_mesh)
 
-                for face in blender_mesh.polygons:
-                    SR2_mesh.faces.extend(face.vertices)
+                # Vertex indices are written as 2-byte values, so a mesh past
+                # that limit cannot be represented and has to be split up
+                if len(SR2_mesh.vertexes) > 0x7FFF:
+                    raise ValueError("{} has {} vertices, more than the {} a MDL mesh can index"
+                                     .format(bl_object.name, len(SR2_mesh.vertexes), 0x7FFF))
 
                 SR2_mesh.model_pointers = bl_object["Model Pointers"]
                 SR2_mesh.model_pointers["Vertex Count"] = len(SR2_mesh.vertexes)
-                SR2_mesh.model_pointers["Face Count"] = len(SR2_mesh.faces)  # Triangle count
+                # Counts indices, not triangles - a 525 triangle mesh stores 1575 here
+                SR2_mesh.model_pointers["Face Count"] = len(SR2_mesh.faces)
 
                 SR2_mesh.draw_options = bl_object["Draw Options"]
 
