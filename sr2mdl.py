@@ -1384,10 +1384,8 @@ def convertBlenderVertexesToSR2Vertexes(blender_mesh):
     return vertexes
 
 
-def save(output_folder_path: str):
-    # Collect all data from a collection and fill SR2_model with it
-
-    # Select the base "Scene Collection" and get all child collections that have SR2MDL file header attached to them
+def prepareSceneForSaving():
+    """ Put the scene in a state where object transforms can be read back """
     # The operator needs something active to act on, and a model made only of
     # mesh-less nodes (tenkougen.mdl, pl01-pl03.mdl) never makes anything active
     active_object = bpy.context.view_layer.objects.active
@@ -1399,83 +1397,93 @@ def save(output_folder_path: str):
     # having run since. Flush it, or every such node exports as untransformed.
     bpy.context.view_layer.update()
 
-    sr2_model_collections = collectSR2Collections(bpy.data.scenes['Scene'].collection)
+
+def save(output_folder_path: str):
+    """ Write every SR2MDL collection of the scene into a folder """
+    # Select the base "Scene Collection" and get all child collections that have SR2MDL file header attached to them
+    sr2_model_collections = collectSR2Collections(bpy.context.scene.collection)
     print("Found", len(sr2_model_collections), "SR2 Collections")
 
-    # Make a SR2MDL class instance for each SR2MDL collection and save each file
     for sr2_collection in sr2_model_collections:
-        SR2_model = SR2MDL()
+        # " repack" is kept on this path so it never overwrites the original
+        saveCollection(sr2_collection, output_folder_path + sr2_collection.name + ".mdl repack")
 
-        SR2_model.file_header = sr2_collection["SR2MDL file header"]
 
-        # Go through each object and make a SR2Node and Mesh out of its data
-        print(sr2_collection.name, "has", len(sr2_collection.objects), "objects")
+def saveCollection(sr2_collection, output_file_path: str):
+    """ Collect all data from one collection, fill a SR2MDL with it and write it out """
+    prepareSceneForSaving()
 
-        for bl_object in sr2_collection.objects:
-            new_node = SR2Node()
+    SR2_model = SR2MDL()
 
-            # Copy it, so filling in the new offsets below does not write back
-            # into the Blender object's custom property
-            new_node.transform = bl_object["Node Transform"].to_dict()
+    SR2_model.file_header = sr2_collection["SR2MDL file header"]
 
-            # Only take the transform from Blender if the object was actually
-            # moved. Re-encoding an untouched one would still change it: the
-            # rotation is quantized to 16 bits per axis, and decomposing a
-            # matrix returns Euler angles in a canonical range that need not be
-            # the ones the file was written with.
-            if not matrixIsUnchanged(bl_object.matrix_local, nodeTransformToMatrix(new_node.transform)):
-                position, rotation, scale = bl_object.matrix_local.decompose()
+    # Go through each object and make a SR2Node and Mesh out of its data
+    print(sr2_collection.name, "has", len(sr2_collection.objects), "objects")
 
-                new_node.transform["Position X"] = position[0]
-                new_node.transform["Position Y"] = position[1]
-                new_node.transform["Position Z"] = position[2]
+    for bl_object in sr2_collection.objects:
+        new_node = SR2Node()
 
-                euler = rotation.to_euler('XYZ')
-                new_node.transform["Rotation X"] = radiansToNodeRotation(euler[0])
-                new_node.transform["Rotation Y"] = radiansToNodeRotation(euler[1])
-                new_node.transform["Rotation Z"] = radiansToNodeRotation(euler[2])
+        # Copy it, so filling in the new offsets below does not write back
+        # into the Blender object's custom property
+        new_node.transform = bl_object["Node Transform"].to_dict()
 
-                new_node.transform["Scale X"] = scale[0]
-                new_node.transform["Scale Y"] = scale[1]
-                new_node.transform["Scale Z"] = scale[2]
+        # Only take the transform from Blender if the object was actually
+        # moved. Re-encoding an untouched one would still change it: the
+        # rotation is quantized to 16 bits per axis, and decomposing a
+        # matrix returns Euler angles in a canonical range that need not be
+        # the ones the file was written with.
+        if not matrixIsUnchanged(bl_object.matrix_local, nodeTransformToMatrix(new_node.transform)):
+            position, rotation, scale = bl_object.matrix_local.decompose()
 
-            new_node.relation = bl_object["Node Relation"]
+            new_node.transform["Position X"] = position[0]
+            new_node.transform["Position Y"] = position[1]
+            new_node.transform["Position Z"] = position[2]
 
-            if bl_object.get("Extra"):
-                new_node.extra = bl_object["Extra"]
+            euler = rotation.to_euler('XYZ')
+            new_node.transform["Rotation X"] = radiansToNodeRotation(euler[0])
+            new_node.transform["Rotation Y"] = radiansToNodeRotation(euler[1])
+            new_node.transform["Rotation Z"] = radiansToNodeRotation(euler[2])
 
-            if bl_object.get("Some Data"):
-                new_node.some_data = bl_object["Some Data"]
+            new_node.transform["Scale X"] = scale[0]
+            new_node.transform["Scale Y"] = scale[1]
+            new_node.transform["Scale Z"] = scale[2]
 
-            SR2_model.nodes.append(new_node)
+        new_node.relation = bl_object["Node Relation"]
 
-            # Fill Mesh, if exist
-            if bl_object.data:
-                SR2_mesh = Mesh()
+        if bl_object.get("Extra"):
+            new_node.extra = bl_object["Extra"]
 
-                blender_mesh = bl_object.data
+        if bl_object.get("Some Data"):
+            new_node.some_data = bl_object["Some Data"]
 
-                SR2_mesh.material = bl_object["Material"]
+        SR2_model.nodes.append(new_node)
 
-                SR2_mesh.vertexes = convertBlenderVertexesToSR2Vertexes(blender_mesh)
-                SR2_mesh.faces = convertBlenderFacesToSR2Faces(blender_mesh)
+        # Fill Mesh, if exist
+        if bl_object.data:
+            SR2_mesh = Mesh()
 
-                # Vertex indices are written as 2-byte values, so a mesh past
-                # that limit cannot be represented and has to be split up
-                if len(SR2_mesh.vertexes) > 0x7FFF:
-                    raise ValueError("{} has {} vertices, more than the {} a MDL mesh can index"
-                                     .format(bl_object.name, len(SR2_mesh.vertexes), 0x7FFF))
+            blender_mesh = bl_object.data
 
-                SR2_mesh.model_pointers = bl_object["Model Pointers"]
-                SR2_mesh.model_pointers["Vertex Count"] = len(SR2_mesh.vertexes)
-                # Counts indices, not triangles - a 525 triangle mesh stores 1575 here
-                SR2_mesh.model_pointers["Face Count"] = len(SR2_mesh.faces)
+            SR2_mesh.material = bl_object["Material"]
 
-                SR2_mesh.draw_options = bl_object["Draw Options"]
+            SR2_mesh.vertexes = convertBlenderVertexesToSR2Vertexes(blender_mesh)
+            SR2_mesh.faces = convertBlenderFacesToSR2Faces(blender_mesh)
 
-                new_node.mesh = SR2_mesh
-                SR2_model.meshes.append(SR2_mesh)
+            # Vertex indices are written as 2-byte values, so a mesh past
+            # that limit cannot be represented and has to be split up
+            if len(SR2_mesh.vertexes) > 0x7FFF:
+                raise ValueError("{} has {} vertices, more than the {} a MDL mesh can index"
+                                 .format(bl_object.name, len(SR2_mesh.vertexes), 0x7FFF))
 
-        output_file_path = output_folder_path + sr2_collection.name + ".mdl"
-        SR2_model.save(output_file_path + " repack")
-        print("Saved at " + output_file_path + " repack")
+            SR2_mesh.model_pointers = bl_object["Model Pointers"]
+            SR2_mesh.model_pointers["Vertex Count"] = len(SR2_mesh.vertexes)
+            # Counts indices, not triangles - a 525 triangle mesh stores 1575 here
+            SR2_mesh.model_pointers["Face Count"] = len(SR2_mesh.faces)
+
+            SR2_mesh.draw_options = bl_object["Draw Options"]
+
+            new_node.mesh = SR2_mesh
+            SR2_model.meshes.append(SR2_mesh)
+
+    SR2_model.save(output_file_path)
+    print("Saved at " + output_file_path)
