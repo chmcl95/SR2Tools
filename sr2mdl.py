@@ -20,6 +20,19 @@ ORIGINAL_NORMAL_ATTRIBUTE = "sr2_normal"
 # deliberate edit.
 NORMAL_EDITED_THRESHOLD = 0.05
 
+# A node's rotation is three unsigned 16-bit values. Import has always read
+# them as pi/0x7FFF radians per unit, which puts a full turn at 0xFFFE, so that
+# is what export wraps at. The hardware convention may well be 0x10000 per turn
+# instead - the difference is 0.005 degrees either way, but it does mean an
+# edited rotation is not guaranteed to come back as the exact same integer.
+ROTATION_UNIT_IN_RADIANS = math.pi / 0x7FFF
+ROTATION_UNITS_PER_TURN = 2 * 0x7FFF
+
+# How far an object may sit from where it was imported before it counts as
+# moved. Node transforms are single precision in the file, so anything above
+# the rounding error of that is a real edit.
+TRANSFORM_EDITED_THRESHOLD = 1e-5
+
 
 def fill_dict_from_bytes_by_formatting(dictionary_to_fill: dict, source_bytes: bytes, formatting: str) -> dict:
     value_list = struct.unpack(formatting, source_bytes)
@@ -27,24 +40,68 @@ def fill_dict_from_bytes_by_formatting(dictionary_to_fill: dict, source_bytes: b
     return dictionary_to_fill
 
 
-def node_has_mesh_data(model_file_bytes: bytes, model_pointers_offset: int) -> bool:
-    """
-    Whether a node's Model Pointers actually describe a mesh.
+def nodeTransformToMatrix(transform) -> mathutils.Matrix:
+    """ Local matrix described by a node transform's position, rotation and scale """
+    position = mathutils.Vector((transform["Position X"],
+                                 transform["Position Y"],
+                                 transform["Position Z"]))
 
-    A node's "unk_0x0C" being NaN does NOT reliably mean the node has no
-    mesh - some real meshes (e.g. small 4-vertex quad props/lights) have
-    it set to NaN too. The reliable signal is the Model Pointers'
-    "Vertex Offset" field, which is 0x00 or 0xFFFFFF when there is no mesh.
+    rotation = mathutils.Euler((transform["Rotation X"] * ROTATION_UNIT_IN_RADIANS,
+                                transform["Rotation Y"] * ROTATION_UNIT_IN_RADIANS,
+                                transform["Rotation Z"] * ROTATION_UNIT_IN_RADIANS), 'XYZ')
+
+    scale = mathutils.Vector((transform["Scale X"],
+                              transform["Scale Y"],
+                              transform["Scale Z"]))
+
+    return mathutils.Matrix.LocRotScale(position, rotation, scale)
+
+
+def matrixIsUnchanged(blender_matrix: mathutils.Matrix, node_matrix: mathutils.Matrix) -> bool:
+    """ Whether an object still sits exactly where the node transform put it """
+    for row_index in range(4):
+        for column_index in range(4):
+            blender_value = blender_matrix[row_index][column_index]
+            node_value = node_matrix[row_index][column_index]
+
+            scale = max(1.0, abs(blender_value), abs(node_value))
+
+            if abs(blender_value - node_value) > TRANSFORM_EDITED_THRESHOLD * scale:
+                return False
+
+    return True
+
+
+def radiansToNodeRotation(angle_in_radians: float) -> int:
+    """ An angle as the unsigned 16-bit value a node transform stores """
+    return int(round(angle_in_radians / ROTATION_UNIT_IN_RADIANS)) % ROTATION_UNITS_PER_TURN
+
+
+def node_has_mesh_data(model_file_bytes: bytes, node: "SR2Node") -> bool:
     """
+    Whether a node points at a mesh rather than at a Some Data block.
+
+    Two earlier signals turned out to be unreliable. "unk_0x0C" being NaN
+    does not mean there is no mesh - some real meshes (e.g. small 4-vertex
+    quad props/lights) have it set to NaN too. Neither does the Model
+    Pointers' "Vertex Offset" being 0x00 or 0xFFFFFF: the Some Data of
+    tenkougen.mdl and pl01-pl03.mdl starts with what looks like a colour
+    (0x00FF4100, 0x00F0F0C8, ...) and passes that test as a mesh.
+
+    The node relation's "unk_0x08" does hold. Over the 189 nodes of the
+    sample files it is 0 for all 168 nodes that have a mesh and 1 for all
+    21 that have Some Data instead.
+    """
+    if node.relation["unk_0x08"] == 1:
+        return False
+
     # Offset 0x00 is the file header, so it can never hold Model Pointers.
     # An offset past the end of the file means the node is not pointing at
     # anything usable either, which happens with mesh-less nodes of a file
     # that was re-exported after the model was made smaller.
-    if model_pointers_offset <= 0 or model_pointers_offset + 0x20 > len(model_file_bytes):
-        return False
+    model_pointers_offset = node.transform["Model Pointers Offset"]
 
-    vertex_offset = struct.unpack_from('<I', model_file_bytes, model_pointers_offset)[0]
-    return vertex_offset != 0x00 and vertex_offset != 0xffffff
+    return 0 < model_pointers_offset and model_pointers_offset + 0x20 <= len(model_file_bytes)
 
 
 
@@ -763,7 +820,7 @@ class SR2MDL:
 
             print("unk 0x0C value {0}".format(node.transform["unk_0x0C"]))
 
-            if not node_has_mesh_data(model_file_bytes, node.transform["Model Pointers Offset"]):
+            if not node_has_mesh_data(model_file_bytes, node):
                 print("Node without Mesh detected")
                 mesh_present = False
 
@@ -785,27 +842,6 @@ class SR2MDL:
             # Go back through the file
             current_node_relation_offset -= node_size
             bytes_left -= node_size
-
-            # Doesn't have mesh attached or something?
-            # Still needs to be included or else the game crashes
-            if node_size == 0x20:
-                if is_last_node:
-                    break
-                continue
-
-            """
-            if (math.isnan(node.transform["unk_0x0C"])  # NAN is 0xFFFFFFFF in float
-                    and node.transform["unk_0x2C"] == 0x00
-                    and node.transform["Rotation X"] == 0x00):
-                continue
-            """
-
-            if ((node.relation["unk_0x08"] == 1)
-                    and node.transform["unk_0x2C"] == 0x00
-                    and node.transform["Rotation X"] == 0x00):
-                if is_last_node:
-                    break
-                continue
 
             # Unpack mesh
             if mesh_present:
@@ -929,14 +965,24 @@ class SR2MDL:
         # Nodes without a mesh can appear anywhere in the list, not just at the
         # end, so self.meshes can't be indexed positionally by node_index -
         # use the node<->mesh association instead.
+        # Some Data blocks follow all the meshes, in node order - see pack_and_return
+        some_data_offset = self.file_header_size
+        for mesh in self.meshes:
+            some_data_offset += mesh.total_size
+
         for node in self.nodes:
-            print("Transform", node.transform["unk_0x0C"], float('-nan'))
             if node.mesh is not None:
                 mesh = node.mesh
 
                 node.transform["Model Pointers Offset"] = (mesh.offset + mesh.sizes["Material"]
                                                            + mesh.sizes["Vertex"] + mesh.sizes["Face"])
                 node.transform["Draw Options Offset"] = node.transform["Model Pointers Offset"] + 0x20
+            elif node.some_data != {}:
+                # A mesh-less node points at its Some Data instead. Leaving the
+                # offset from the file it was imported from makes it dangle as
+                # soon as anything before it changes size.
+                node.transform["Model Pointers Offset"] = some_data_offset
+                some_data_offset += 0x20
 
     def update_node_offsets(self):
         self.update_node_offset_to_model_pointers()
@@ -974,7 +1020,7 @@ class SR2MDL:
 
         # Calculate new offset of each node (in reverse order since that's how they are stored)
         node_size = 0x80
-        for node_index in range(len(self.nodes) - 1, 0, -1):
+        for node_index in range(len(self.nodes) - 1, -1, -1):
             print("New node offset", new_node_offset)
             self.nodes[node_index].extra["Offset"] = new_node_offset
             new_node_offset += node_size
@@ -1139,9 +1185,7 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     bl_mesh = bpy.context.object.data
 
     # Apply Transforms
-    euler = mathutils.Euler(mathutils.Vector((node.rotation[0]/0x7FFF*math.pi, node.rotation[1]/0x7FFF*math.pi, node.rotation[2]/0x7FFF*math.pi)), 'XYZ')
-    local_mtx = mathutils.Matrix.LocRotScale(node.position, euler, node.scale)
-    bl_obj.matrix_local = local_mtx
+    bl_obj.matrix_local = nodeTransformToMatrix(node.transform)
 
     turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh)
 
@@ -1188,6 +1232,13 @@ def load(filepath: str, global_matrix: mathutils.Matrix):
 
             bl_obj["Node Relation"] = node.relation
             model_collection.objects.link(bl_obj)
+
+            # These carry a position and scale just like the mesh nodes do -
+            # leaving the empty at the origin makes export write that back.
+            # Applied to matrix_local rather than matrix_world, which reads
+            # back as identity until the depsgraph has caught up.
+            bl_obj.matrix_local = (mathutils.Matrix.inverted(global_matrix)
+                                   @ nodeTransformToMatrix(node.transform))
 
 
 def isSR2MDLcollection(blender_collection):
@@ -1337,7 +1388,16 @@ def save(output_folder_path: str):
     # Collect all data from a collection and fill SR2_model with it
 
     # Select the base "Scene Collection" and get all child collections that have SR2MDL file header attached to them
-    bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+    # The operator needs something active to act on, and a model made only of
+    # mesh-less nodes (tenkougen.mdl, pl01-pl03.mdl) never makes anything active
+    active_object = bpy.context.view_layer.objects.active
+    if active_object is not None and active_object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+
+    # Reading matrix_local gives the last evaluated matrix, which is still the
+    # identity for an object whose transform was set without the depsgraph
+    # having run since. Flush it, or every such node exports as untransformed.
+    bpy.context.view_layer.update()
 
     sr2_model_collections = collectSR2Collections(bpy.data.scenes['Scene'].collection)
     print("Found", len(sr2_model_collections), "SR2 Collections")
@@ -1354,22 +1414,30 @@ def save(output_folder_path: str):
         for bl_object in sr2_collection.objects:
             new_node = SR2Node()
 
-            new_node.transform = bl_object["Node Transform"]
-            # Apply Blender Inspector Values
-            locRotScale = bl_object.matrix_local.decompose()
-            # Position
-            new_node.transform["Position X"] = locRotScale[0][0]
-            new_node.transform["Position Y"] = locRotScale[0][1]
-            new_node.transform["Position Z"] = locRotScale[0][2]
-            # Rotation
-            euler = locRotScale[1].to_euler('XYZ')
-            new_node.transform["Scale X"] = euler[0]/math.pi*0x7FFF
-            new_node.transform["Scale Y"] = euler[1]/math.pi*0x7FFF
-            new_node.transform["Scale Z"] = euler[2]/math.pi*0x7FFF
-            # Scale
-            new_node.transform["Scale X"] = locRotScale[2][0]
-            new_node.transform["Scale Y"] = locRotScale[2][1]
-            new_node.transform["Scale Z"] = locRotScale[2][2]
+            # Copy it, so filling in the new offsets below does not write back
+            # into the Blender object's custom property
+            new_node.transform = bl_object["Node Transform"].to_dict()
+
+            # Only take the transform from Blender if the object was actually
+            # moved. Re-encoding an untouched one would still change it: the
+            # rotation is quantized to 16 bits per axis, and decomposing a
+            # matrix returns Euler angles in a canonical range that need not be
+            # the ones the file was written with.
+            if not matrixIsUnchanged(bl_object.matrix_local, nodeTransformToMatrix(new_node.transform)):
+                position, rotation, scale = bl_object.matrix_local.decompose()
+
+                new_node.transform["Position X"] = position[0]
+                new_node.transform["Position Y"] = position[1]
+                new_node.transform["Position Z"] = position[2]
+
+                euler = rotation.to_euler('XYZ')
+                new_node.transform["Rotation X"] = radiansToNodeRotation(euler[0])
+                new_node.transform["Rotation Y"] = radiansToNodeRotation(euler[1])
+                new_node.transform["Rotation Z"] = radiansToNodeRotation(euler[2])
+
+                new_node.transform["Scale X"] = scale[0]
+                new_node.transform["Scale Y"] = scale[1]
+                new_node.transform["Scale Z"] = scale[2]
 
             new_node.relation = bl_object["Node Relation"]
 
