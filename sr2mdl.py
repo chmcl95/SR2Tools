@@ -8,6 +8,19 @@ import bmesh
 import bpy
 
 
+# Mesh attribute holding the normals exactly as they were read from the MDL
+ORIGINAL_NORMAL_ATTRIBUTE = "sr2_normal"
+
+# How far a normal may drift from the imported one before it counts as edited
+# by the user. Blender's custom normal storage is lossy - it normalizes the
+# vectors and quantizes them per corner - so an untouched mesh comes back with
+# a small error of its own, which this has to stay above. Re-importing every
+# MDL of a car folder puts that error at up to 0.032 on Blender 4.0 and 4.2,
+# and up to 0.005 on 4.3 and 5.0. 0.05 is roughly 3 degrees, well below any
+# deliberate edit.
+NORMAL_EDITED_THRESHOLD = 0.05
+
+
 def fill_dict_from_bytes_by_formatting(dictionary_to_fill: dict, source_bytes: bytes, formatting: str) -> dict:
     value_list = struct.unpack(formatting, source_bytes)
     dictionary_to_fill = dict(zip(dictionary_to_fill.keys(), value_list))
@@ -1056,7 +1069,20 @@ def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
         bl_mesh.uv_layers[channel_name].data[i].uv = uvs[loop.vertex_index]
 
     # Apply normals
+    # Custom normals are only honoured with auto smooth on before Blender 4.1,
+    # which removed the flag and always applies them
+    if hasattr(bl_mesh, "use_auto_smooth"):
+        bl_mesh.use_auto_smooth = True
+
     bl_mesh.normals_split_custom_set_from_vertices(normals)
+
+    # Blender normalizes and quantizes custom normals, while the MDL values are
+    # neither unit length nor stored at full precision. Keep the untouched
+    # originals around so an unedited mesh can be written back byte for byte.
+    stored_normals = bl_mesh.attributes.new(name=ORIGINAL_NORMAL_ATTRIBUTE,
+                                            type='FLOAT_VECTOR',
+                                            domain='POINT')
+    stored_normals.data.foreach_set("vector", [value for normal in normals for value in normal])
 
 
 def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: mathutils.Matrix, model_collection):
@@ -1164,37 +1190,102 @@ def collectSR2Collections(base_collection):
     return sr2_model_collections
 
 
+def getCornerNormals(blender_mesh):
+    """
+    Per-corner (split) normals of a mesh.
+
+    These are what carry the custom normals applied on import
+    (normals_split_custom_set_from_vertices), unlike Mesh.vertices[].normal
+    which is always recomputed by Blender from the face topology.
+
+    Blender 4.1 removed MeshLoop.normal and Mesh.calc_normals_split() in
+    favour of Mesh.corner_normals, so both spellings are supported here.
+    """
+    corner_normals = blender_mesh.corner_normals
+
+    if len(corner_normals) == len(blender_mesh.loops):
+        return [mathutils.Vector(normal.vector) for normal in corner_normals]
+
+    # Blender 4.0 and older have corner_normals too, but leave it empty until
+    # the split normals are calculated, and expose them on the loops instead
+    blender_mesh.calc_normals_split()
+    return [mathutils.Vector(loop.normal) for loop in blender_mesh.loops]
+
+
+def getOriginalNormals(blender_mesh):
+    """ Normals as they were imported, or None if they aren't available """
+    stored_normals = blender_mesh.attributes.get(ORIGINAL_NORMAL_ATTRIBUTE)
+
+    if stored_normals is None or stored_normals.domain != 'POINT':
+        return None
+
+    if len(stored_normals.data) != len(blender_mesh.vertices):
+        return None
+
+    flat_normals = [0.0] * (len(blender_mesh.vertices) * 3)
+    stored_normals.data.foreach_get("vector", flat_normals)
+
+    return [flat_normals[i:i + 3] for i in range(0, len(flat_normals), 3)]
+
+
 def convertBlenderVertexesToSR2Vertexes(blender_mesh):
     vertexes = []
+
+    # A MDL vertex holds a single normal, while Blender stores one per corner.
+    # Average the corners sharing a vertex - after an untouched import they all
+    # hold the same normal anyway, so this restores the original value.
+    corner_normals = getCornerNormals(blender_mesh)
+    averaged_normals = [mathutils.Vector((0.0, 0.0, 0.0)) for _ in blender_mesh.vertices]
+
+    for corner_index, loop in enumerate(blender_mesh.loops):
+        averaged_normals[loop.vertex_index] += corner_normals[corner_index]
+
+    original_normals = getOriginalNormals(blender_mesh)
 
     # Position and normals
     for vertex_index in range(len(blender_mesh.vertices)):
         blender_vertex = blender_mesh.vertices[vertex_index]
-        blender_normal = blender_vertex.normal
+
+        blender_normal = averaged_normals[vertex_index]
+        if blender_normal.length > 0.0:
+            blender_normal.normalize()
+        else:
+            # Loose vertex - not part of any face, so it has no corner normal
+            blender_normal = mathutils.Vector(blender_vertex.normal)
 
         SR2_vertex = Vertex()
         SR2_vertex.position = [blender_vertex.co.x,
                                blender_vertex.co.y,
                                blender_vertex.co.z]
 
-        SR2_vertex.normal = list(blender_normal)
+        # The original files store normals rounded to 3 decimals. Keeping that
+        # here also cancels out the precision loss of Blender's custom normal
+        # storage, which is quantized to 16 bits per corner.
+        SR2_vertex.normal = [round(blender_normal[0], 3),
+                             round(blender_normal[1], 3),
+                             round(blender_normal[2], 3)]
 
-        SR2_vertex.normal[0] = round(SR2_vertex.normal[0], 3)
-        SR2_vertex.normal[1] = round(SR2_vertex.normal[1], 3)
-        SR2_vertex.normal[2] = round(SR2_vertex.normal[2], 3)
+        # Vertices that were not touched since the import get their original
+        # normal back untranslated - normalizing an MDL normal (they are not
+        # quite unit length) is enough to shift that third decimal on its own.
+        if original_normals is not None:
+            original_normal = mathutils.Vector(original_normals[vertex_index])
+
+            if original_normal.length > 0.0:
+                difference = max(abs(component)
+                                 for component in (original_normal.normalized() - blender_normal))
+
+                if difference <= NORMAL_EDITED_THRESHOLD:
+                    SR2_vertex.normal = list(original_normals[vertex_index])
 
         vertexes.append(SR2_vertex)
 
-    # UVs and Custom-Split Normals
+    # UVs
     for i, loop in enumerate(blender_mesh.loops):
-        # UV
         fliped_uv = [blender_mesh.uv_layers["uv0"].data[i].uv[0], blender_mesh.uv_layers["uv0"].data[i].uv[1]]
         # flip V-coordinate
         fliped_uv[1] = -(fliped_uv[1] - 1.0)
         vertexes[loop.vertex_index].uv = fliped_uv
-        # Custom-Split Normals
-        #vertexes[loop.vertex_index].normal = loop.normal
-
 
     return vertexes
 
