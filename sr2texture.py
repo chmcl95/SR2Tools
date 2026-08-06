@@ -32,18 +32,25 @@ TEXTURE_CLASS_BY_SIGNATURE = {
 # Tried in order next to the model, first one that exists wins
 TEXTURE_EXTENSIONS = (".txr", ".TXR", ".tex", ".TEX")
 
+# The same set for looking at names already on disk, where the case is whatever
+# the game shipped - WINDOW.TXR and blur.txr sit in the same folder
+LOWERCASE_TEXTURE_EXTENSIONS = {extension.lower() for extension in TEXTURE_EXTENSIONS}
+
 # A car does not ship one texture file per model. Its parts index into a list
 # the game builds while loading, and node transforms confirm the order: the
 # body meshes of r_corolla ask for 0, the wheels for 1 and the windows for 2.
 # Only the clean textures are picked up - the *_dirt* ones are the same images
 # with mud on them, swapped in as a race goes on.
-CAR_TEXTURE_FILE_NAMES = (
-    "body",
-    # ta, de and sn are the tarmac, desert and snow tyres. Tarmac is the plain one
-    "ta_tire",
-    # Index 2 is the windows, whose texture lives outside the car folder
-    None,
-)
+CAR_BODY_TEXTURE_NAME = "body"
+
+# ta, de and sn are the tarmac, desert and snow tyres. Tarmac is the plain one
+CAR_TYRE_TEXTURE_NAME = "ta_tire"
+
+# The windows come out of the EFFECT folder sitting next to the car folders,
+# which every car shares. The game also draws the wind01..wind14 variants kept
+# there on a windscreen; WINDOW is the plain one
+CAR_EFFECT_FOLDER_NAME = "EFFECT"
+CAR_WINDOW_TEXTURE_NAME = "WINDOW"
 
 # "Color Format" of a texture header. Everything else is RGB565
 COLOR_FORMAT_ARGB1555 = 2
@@ -189,41 +196,58 @@ def findCarTextureFile(folder: str, file_name: str):
     it is a separator rather than more of a word, or "body" would pick up a
     file called "nobody".
     """
+    wanted = file_name.lower()
+
     for entry in sorted(os.listdir(folder)):
         stem, extension = os.path.splitext(entry)
 
-        if extension not in TEXTURE_EXTENSIONS:
+        if extension.lower() not in LOWERCASE_TEXTURE_EXTENSIONS:
             continue
 
-        if stem == file_name:
+        stem = stem.lower()
+
+        if stem == wanted:
             return os.path.join(folder, entry)
 
-        if stem.endswith(file_name) and not stem[-len(file_name) - 1].isalnum():
+        if stem.endswith(wanted) and not stem[-len(wanted) - 1].isalnum():
             return os.path.join(folder, entry)
 
     return None
+
+
+def findWindowTexture(car_folder: str):
+    """ The shared window texture, in the EFFECT folder next to the car folders """
+    effect_folder = os.path.join(os.path.dirname(os.path.normpath(car_folder)),
+                                 CAR_EFFECT_FOLDER_NAME)
+
+    if not os.path.isdir(effect_folder):
+        return None
+
+    return findCarTextureFile(effect_folder, CAR_WINDOW_TEXTURE_NAME)
+
+
+def firstImageOfTextureFile(texture_file_path):
+    """ The first texture of a file as a Blender image, for the single ones """
+    if texture_file_path is None:
+        return None
+
+    images = imagesFromTextureFile(texture_file_path)
+
+    return images[0] if images else None
 
 
 def carTextureList(model_file_path: str):
     """ The textures a car part indexes into, or None if this is not a car """
     folder = os.path.dirname(model_file_path) or "."
 
-    if not os.path.isdir(folder) or findCarTextureFile(folder, CAR_TEXTURE_FILE_NAMES[0]) is None:
+    if not os.path.isdir(folder) or findCarTextureFile(folder, CAR_BODY_TEXTURE_NAME) is None:
         return None
 
-    images = []
-
-    for file_name in CAR_TEXTURE_FILE_NAMES:
-        texture_file_path = None if file_name is None else findCarTextureFile(folder, file_name)
-
-        if texture_file_path is None:
-            images.append(None)
-            continue
-
-        from_file = imagesFromTextureFile(texture_file_path)
-        images.append(from_file[0] if from_file else None)
-
-    return images
+    return [
+        firstImageOfTextureFile(findCarTextureFile(folder, CAR_BODY_TEXTURE_NAME)),
+        firstImageOfTextureFile(findCarTextureFile(folder, CAR_TYRE_TEXTURE_NAME)),
+        firstImageOfTextureFile(findWindowTexture(folder)),
+    ]
 
 
 def loadTexturesForModel(model_file_path: str):
