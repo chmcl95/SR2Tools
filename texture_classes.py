@@ -2,8 +2,15 @@
 Python classes for handling Sega Rally 2 textures
 """
 import struct
-from bmp_handler import BMPv5
-from unyakuza import unyakuza
+
+# Relative when imported as part of the Blender add-on package, absolute when
+# this module is run on its own, the way the GUI tool does
+try:
+    from .bmp_handler import BMPv5
+    from .unyakuza import unyakuza
+except ImportError:
+    from bmp_handler import BMPv5
+    from unyakuza import unyakuza
 
 
 def fill_dict_from_bytes_by_formatting(dictionary_to_fill: dict, source_bytes: bytes, formatting: str) -> dict:

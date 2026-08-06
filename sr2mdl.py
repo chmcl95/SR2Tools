@@ -7,6 +7,13 @@ import mathutils
 import bmesh
 import bpy
 
+# Relative when imported as part of the Blender add-on package, absolute when
+# this module is run on its own
+try:
+    from . import sr2texture
+except ImportError:
+    import sr2texture
+
 
 # Mesh attribute holding the normals exactly as they were read from the MDL
 ORIGINAL_NORMAL_ATTRIBUTE = "sr2_normal"
@@ -1174,7 +1181,7 @@ def colorComponentToByte(component: float) -> int:
     return max(0, min(255, int(round(component * 255.0))))
 
 
-def makeBlenderMaterial(sr2_material, material_name: str):
+def makeBlenderMaterial(sr2_material, material_name: str, blender_image=None):
     """
     A Blender material carrying the MDL material values.
 
@@ -1186,6 +1193,9 @@ def makeBlenderMaterial(sr2_material, material_name: str):
 
     # Something recognisable in the viewport instead of the default grey
     blender_material.diffuse_color = [sr2_material[key] / 255.0 for key in MATERIAL_COLOR_0_KEYS]
+
+    if blender_image is not None:
+        sr2texture.wireImageIntoMaterial(blender_material, blender_image)
 
     material_properties = getattr(blender_material, MATERIAL_PROPERTY, None)
 
@@ -1239,7 +1249,8 @@ def sr2MaterialFromBlenderMesh(blender_mesh, bl_object):
     return dict.copy(SR2MDL_material)
 
 
-def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: mathutils.Matrix, model_collection):
+def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: mathutils.Matrix,
+                  model_collection, blender_image=None):
     """ Make an empty Blender object and fill it with extracted MDL data """
 
     # Make an empty Blender object
@@ -1262,7 +1273,8 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     # The material goes on the mesh, where Blender expects it, so it can be
     # edited from the Material tab and follows the mesh when it gets copied
     bl_mesh.materials.append(makeBlenderMaterial(model_mesh.material,
-                                                 'material_{0:04}'.format(index)))
+                                                 'material_{0:04}'.format(index),
+                                                 blender_image))
 
     model_collection.objects.link(bl_obj)
 
@@ -1277,7 +1289,7 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh)
 
 
-def load(filepath: str, global_matrix: mathutils.Matrix):
+def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = True):
     """
     Read a MDL into a new collection.
 
@@ -1285,6 +1297,8 @@ def load(filepath: str, global_matrix: mathutils.Matrix):
     Blender is Z-up, so without one the model comes in lying on its back. It
     is stored on the collection, because export has to undo exactly the same
     conversion no matter which axes the model was brought in with.
+
+    load_textures picks up the texture file next to the model, if there is one.
     """
     # Creating objects while in Edit Mode would leave the mesh data locked
     active_object = bpy.context.view_layer.objects.active
@@ -1310,13 +1324,20 @@ def load(filepath: str, global_matrix: mathutils.Matrix):
     # Remember how the axes were converted, so export can undo it
     model_collection[AXIS_CONVERSION_PROPERTY] = [value for row in global_matrix for value in row]
 
+    # The nth mesh takes the nth texture of the file - see loadTexturesForModel
+    blender_images = sr2texture.loadTexturesForModel(filepath) if load_textures else []
+    mesh_count = 0
+
     # Turn every node into a blender object and attach mesh to it, if present
     # (nodes without a mesh can appear anywhere in the list, not just at the
     # end, so the node<->mesh association set during unpack must be used
     # instead of comparing indexes against len(SR2_model.meshes))
     for index, node in enumerate(SR2_model.nodes):
         if node.mesh is not None:
-            generate_mesh(node, node.mesh, index, global_matrix, model_collection)
+            blender_image = blender_images[mesh_count] if mesh_count < len(blender_images) else None
+            mesh_count += 1
+
+            generate_mesh(node, node.mesh, index, global_matrix, model_collection, blender_image)
         else:
             node_name = 'node_{0:04}'.format(index)
             bl_obj = bpy.data.objects.new(node_name, None)
