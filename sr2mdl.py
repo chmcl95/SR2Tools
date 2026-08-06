@@ -15,6 +15,9 @@ except ImportError:
     import sr2texture
 
 
+# A node transform's "Texture Index" when the mesh is drawn untextured
+NO_TEXTURE_INDEX = -1
+
 # Mesh attribute holding the normals exactly as they were read from the MDL
 ORIGINAL_NORMAL_ATTRIBUTE = "sr2_normal"
 
@@ -101,9 +104,9 @@ def node_has_mesh_data(model_file_bytes: bytes, node: "SR2Node") -> bool:
     """
     Whether a node points at a mesh rather than at a Some Data block.
 
-    Two earlier signals turned out to be unreliable. "unk_0x0C" being NaN
-    does not mean there is no mesh - some real meshes (e.g. small 4-vertex
-    quad props/lights) have it set to NaN too. Neither does the Model
+    Two earlier signals turned out to be unreliable. The field at 0x0C being
+    NaN does not mean there is no mesh - it is the Texture Index, and NaN is
+    what -1 looks like when read as a float. Neither does the Model
     Pointers' "Vertex Offset" being 0x00 or 0xFFFFFF: the Some Data of
     tenkougen.mdl and pl01-pl03.mdl starts with what looks like a colour
     (0x00FF4100, 0x00F0F0C8, ...) and passes that test as a mesh.
@@ -194,7 +197,10 @@ SR2MDL_node_transform = {
     "Model Pointers Offset": 0,
     "Draw Options Offset": 0,
     "Node Index": 0,
-    "unk_0x0C": 0.0,
+    # Which texture of the model's texture list the mesh uses, -1 for none.
+    # Stored where five floats used to be read, which is why it looked like NaN
+    # (-1) or a denormal so small it printed as 1.4e-45 (1) before
+    "Texture Index": NO_TEXTURE_INDEX,
 
     "unk_0x10": 0.0,
     "unk_0x14": 0.0,
@@ -527,7 +533,9 @@ SR2Node_extra = {
 
 
 class SR2Node:
-    format_transform = '<3I' + '5f' + '3f' + '1I' + '6H' + '1I' + '3f' + '5I'
+    # The '1i' is the Texture Index, which used to be read as the first of five
+    # floats. Same bytes, same size - only the interpretation changes
+    format_transform = '<3I' + '1i' + '4f' + '3f' + '1I' + '6H' + '1I' + '3f' + '5I'
     format_relation = '<8I'
 
     format = '<4I' + '4f' + '3f' + '5I' + '3f' + "5I" + '8I'
@@ -815,7 +823,7 @@ class SR2MDL:
         total_mesh_node_size = self.file_header["Relation Offset"] + node_relation_size - self.file_header_size
 
         # Unpack nodes and related mesh, if exist
-        # If a node has 0xFFFFFFFF at unk_0x0C, then it doesn't have mesh, but other data
+        # A node's Texture Index is -1 when its mesh is drawn untextured
 
         first_node_relation_offset = self.file_header["Relation Offset"]
 
@@ -838,7 +846,7 @@ class SR2MDL:
                                           current_node_relation_offset - node_transform_size + node_size]
             node.unpack_from_bytes(node_bytes)
 
-            print("unk 0x0C value {0}".format(node.transform["unk_0x0C"]))
+            print("Texture Index {0}".format(node.transform["Texture Index"]))
 
             if not node_has_mesh_data(model_file_bytes, node):
                 print("Node without Mesh detected")
@@ -1324,9 +1332,8 @@ def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = T
     # Remember how the axes were converted, so export can undo it
     model_collection[AXIS_CONVERSION_PROPERTY] = [value for row in global_matrix for value in row]
 
-    # The nth mesh takes the nth texture of the file - see loadTexturesForModel
+    # Each node names the texture its mesh uses - see loadTexturesForModel
     blender_images = sr2texture.loadTexturesForModel(filepath) if load_textures else []
-    mesh_count = 0
 
     # Turn every node into a blender object and attach mesh to it, if present
     # (nodes without a mesh can appear anywhere in the list, not just at the
@@ -1334,8 +1341,14 @@ def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = T
     # instead of comparing indexes against len(SR2_model.meshes))
     for index, node in enumerate(SR2_model.nodes):
         if node.mesh is not None:
-            blender_image = blender_images[mesh_count] if mesh_count < len(blender_images) else None
-            mesh_count += 1
+            texture_index = node.transform["Texture Index"]
+
+            blender_image = None
+            if 0 <= texture_index < len(blender_images):
+                blender_image = blender_images[texture_index]
+            elif texture_index != NO_TEXTURE_INDEX and blender_images:
+                print("!!! Node {} wants texture {}, which the texture file does not have !!!".format(
+                    index, texture_index))
 
             generate_mesh(node, node.mesh, index, global_matrix, model_collection, blender_image)
         else:
@@ -1563,6 +1576,12 @@ def saveCollection(sr2_collection, output_file_path: str):
         # Copy it, so filling in the new offsets below does not write back
         # into the Blender object's custom property
         new_node.transform = bl_object["Node Transform"].to_dict()
+
+        # Objects imported before the Texture Index was recognised carry the
+        # same bytes read as a float. Put them back the way they came in
+        texture_index = new_node.transform.get("Texture Index")
+        if isinstance(texture_index, float):
+            new_node.transform["Texture Index"] = struct.unpack('<i', struct.pack('<f', texture_index))[0]
 
         # Only take the transform from Blender if the object was actually
         # moved. Re-encoding an untouched one would still change it: the

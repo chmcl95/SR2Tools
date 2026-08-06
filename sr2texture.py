@@ -32,6 +32,19 @@ TEXTURE_CLASS_BY_SIGNATURE = {
 # Tried in order next to the model, first one that exists wins
 TEXTURE_EXTENSIONS = (".txr", ".TXR", ".tex", ".TEX")
 
+# A car does not ship one texture file per model. Its parts index into a list
+# the game builds while loading, and node transforms confirm the order: the
+# body meshes of r_corolla ask for 0, the wheels for 1 and the windows for 2.
+# Only the clean textures are picked up - the *_dirt* ones are the same images
+# with mud on them, swapped in as a race goes on.
+CAR_TEXTURE_FILE_NAMES = (
+    "body",
+    # ta, de and sn are the tarmac, desert and snow tyres. Tarmac is the plain one
+    "ta_tire",
+    # Index 2 is the windows, whose texture lives outside the car folder
+    None,
+)
+
 # "Color Format" of a texture header. Everything else is RGB565
 COLOR_FORMAT_ARGB1555 = 2
 COLOR_FORMAT_ARGB4444 = 8
@@ -140,22 +153,8 @@ def blenderImageFromTexture(texture, texture_index: int, image_name: str):
     return blender_image
 
 
-def loadTexturesForModel(model_file_path: str):
-    """
-    The images of the texture file belonging to a model, in file order.
-
-    Which mesh gets which one is not spelled out anywhere in the MDL. Every
-    Track model that has a texture file next to it holds exactly as many meshes
-    as that file holds textures, and the fields that could carry an index
-    (Draw Options "unk_0x00", Model Pointers "unk_0x18") are the same for both
-    meshes of the two-texture models, so the nth mesh is taken to use the nth
-    texture until something says otherwise.
-    """
-    texture_file_path = findTextureFile(model_file_path)
-
-    if texture_file_path is None:
-        return []
-
+def imagesFromTextureFile(texture_file_path: str):
+    """ Every texture of one file, as Blender images, in file order """
     try:
         texture = openTextureFile(texture_file_path)
     except Exception as exception:
@@ -178,6 +177,72 @@ def loadTexturesForModel(model_file_path: str):
     print("Loaded {} texture(s) from {}".format(len(images), os.path.basename(texture_file_path)))
 
     return images
+
+
+def findCarTextureFile(folder: str, file_name: str):
+    """
+    A car texture of the folder, by the name the game knows it under.
+
+    Files pulled out of the Dreamcast archives keep the path they came from in
+    their name, so body.txr can arrive as
+    "D+-<something>-celica_txb-body.txr". Matching the end of the name covers
+    both, as long as what comes before it is a separator rather than more of a
+    word - "body" must not pick up a file called "nobody".
+    """
+    for entry in sorted(os.listdir(folder)):
+        stem, extension = os.path.splitext(entry)
+
+        if extension not in TEXTURE_EXTENSIONS:
+            continue
+
+        if stem == file_name:
+            return os.path.join(folder, entry)
+
+        if stem.endswith(file_name) and not stem[-len(file_name) - 1].isalnum():
+            return os.path.join(folder, entry)
+
+    return None
+
+
+def carTextureList(model_file_path: str):
+    """ The textures a car part indexes into, or None if this is not a car """
+    folder = os.path.dirname(model_file_path) or "."
+
+    if not os.path.isdir(folder) or findCarTextureFile(folder, CAR_TEXTURE_FILE_NAMES[0]) is None:
+        return None
+
+    images = []
+
+    for file_name in CAR_TEXTURE_FILE_NAMES:
+        texture_file_path = None if file_name is None else findCarTextureFile(folder, file_name)
+
+        if texture_file_path is None:
+            images.append(None)
+            continue
+
+        from_file = imagesFromTextureFile(texture_file_path)
+        images.append(from_file[0] if from_file else None)
+
+    return images
+
+
+def loadTexturesForModel(model_file_path: str):
+    """
+    The textures a model's nodes index into, by "Texture Index".
+
+    A Track model ships its own file under the same name (tree_a.mdl and
+    tree_a.txr) and the index picks a texture inside it. A car has no such
+    file; its parts index into a list the game assembles from the shared
+    textures of the car folder, see CAR_TEXTURE_FILE_NAMES.
+    """
+    texture_file_path = findTextureFile(model_file_path)
+
+    if texture_file_path is not None:
+        return imagesFromTextureFile(texture_file_path)
+
+    car_images = carTextureList(model_file_path)
+
+    return car_images if car_images is not None else []
 
 
 def wireImageIntoMaterial(blender_material, blender_image):
