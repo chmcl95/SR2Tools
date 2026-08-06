@@ -15,6 +15,15 @@ ORIGINAL_NORMAL_ATTRIBUTE = "sr2_normal"
 # flattened row by row. Export reads it back to undo the same conversion.
 AXIS_CONVERSION_PROPERTY = "SR2MDL axis conversion"
 
+# Property group holding a mesh's MDL material on a Blender material, so it can
+# be edited from the Material tab. Registered by the add-on, see __init__.py
+MATERIAL_PROPERTY = "sr2_mdl_material"
+
+# The material fields, in the order they are packed
+MATERIAL_COLOR_0_KEYS = ("R0", "G0", "B0", "A0")
+MATERIAL_COLOR_1_KEYS = ("R1", "G1", "B1", "A1")
+MATERIAL_FLOAT_KEYS = ("unk_0x08", "unk_0x0C", "unk_0x10", "unk_0x14", "unk_0x18", "unk_0x1C")
+
 # How far a normal may drift from the imported one before it counts as edited
 # by the user. Blender's custom normal storage is lossy - it normalizes the
 # vectors and quantizes them per corner - so an untouched mesh comes back with
@@ -1160,6 +1169,76 @@ def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
     stored_normals.data.foreach_set("vector", [value for normal in normals for value in normal])
 
 
+def colorComponentToByte(component: float) -> int:
+    """ A 0..1 colour component as the 0..255 byte a MDL material stores """
+    return max(0, min(255, int(round(component * 255.0))))
+
+
+def makeBlenderMaterial(sr2_material, material_name: str):
+    """
+    A Blender material carrying the MDL material values.
+
+    They live on a property group so the Material tab can edit them, see the
+    add-on's SR2MDLMaterialProperties. Without the add-on registered - running
+    this module on its own - the values are still kept as a custom property.
+    """
+    blender_material = bpy.data.materials.new(name=material_name)
+
+    # Something recognisable in the viewport instead of the default grey
+    blender_material.diffuse_color = [sr2_material[key] / 255.0 for key in MATERIAL_COLOR_0_KEYS]
+
+    material_properties = getattr(blender_material, MATERIAL_PROPERTY, None)
+
+    if material_properties is None:
+        blender_material["Material"] = sr2_material
+        return blender_material
+
+    material_properties.color_0 = [sr2_material[key] / 255.0 for key in MATERIAL_COLOR_0_KEYS]
+    material_properties.color_1 = [sr2_material[key] / 255.0 for key in MATERIAL_COLOR_1_KEYS]
+
+    for key in MATERIAL_FLOAT_KEYS:
+        setattr(material_properties, key, sr2_material[key])
+
+    return blender_material
+
+
+def sr2MaterialFromBlenderMesh(blender_mesh, bl_object):
+    """
+    The MDL material to write for a mesh.
+
+    Falls back to the "Material" custom property of objects imported before
+    materials were made editable, and to the defaults for a mesh built by hand.
+    """
+    for blender_material in blender_mesh.materials:
+        if blender_material is None:
+            continue
+
+        material_properties = getattr(blender_material, MATERIAL_PROPERTY, None)
+
+        if material_properties is None:
+            if blender_material.get("Material"):
+                return dict(blender_material["Material"].to_dict())
+            continue
+
+        sr2_material = dict.copy(SR2MDL_material)
+
+        for index, key in enumerate(MATERIAL_COLOR_0_KEYS):
+            sr2_material[key] = colorComponentToByte(material_properties.color_0[index])
+
+        for index, key in enumerate(MATERIAL_COLOR_1_KEYS):
+            sr2_material[key] = colorComponentToByte(material_properties.color_1[index])
+
+        for key in MATERIAL_FLOAT_KEYS:
+            sr2_material[key] = getattr(material_properties, key)
+
+        return sr2_material
+
+    if bl_object.get("Material"):
+        return dict(bl_object["Material"].to_dict())
+
+    return dict.copy(SR2MDL_material)
+
+
 def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: mathutils.Matrix, model_collection):
     """ Make an empty Blender object and fill it with extracted MDL data """
 
@@ -1177,9 +1256,13 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     bl_obj["Extra"] = node.extra
 
     # Attach all of this to bl_obj instead of bl_mesh to allow copying mesh from other places
-    bl_obj["Material"] = model_mesh.material
     bl_obj["Model Pointers"] = model_mesh.model_pointers
     bl_obj["Draw Options"] = model_mesh.draw_options
+
+    # The material goes on the mesh, where Blender expects it, so it can be
+    # edited from the Material tab and follows the mesh when it gets copied
+    bl_mesh.materials.append(makeBlenderMaterial(model_mesh.material,
+                                                 'material_{0:04}'.format(index)))
 
     model_collection.objects.link(bl_obj)
 
@@ -1499,7 +1582,7 @@ def saveCollection(sr2_collection, output_file_path: str):
 
             blender_mesh = bl_object.data
 
-            SR2_mesh.material = bl_object["Material"]
+            SR2_mesh.material = sr2MaterialFromBlenderMesh(blender_mesh, bl_object)
 
             SR2_mesh.vertexes = convertBlenderVertexesToSR2Vertexes(blender_mesh)
             SR2_mesh.faces = convertBlenderFacesToSR2Faces(blender_mesh)
