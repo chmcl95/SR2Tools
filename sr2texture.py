@@ -183,11 +183,11 @@ def findCarTextureFile(folder: str, file_name: str):
     """
     A car texture of the folder, by the name the game knows it under.
 
-    Files pulled out of the Dreamcast archives keep the path they came from in
-    their name, so body.txr can arrive as
-    "D+-<something>-celica_txb-body.txr". Matching the end of the name covers
-    both, as long as what comes before it is a separator rather than more of a
-    word - "body" must not pick up a file called "nobody".
+    Files pulled out of an archive can keep the path they came from in their
+    name, arriving as something like "D+-share-TXB-celica_txb-body.txr", so
+    the end of the name counts as a match too - as long as what comes before
+    it is a separator rather than more of a word, or "body" would pick up a
+    file called "nobody".
     """
     for entry in sorted(os.listdir(folder)):
         stem, extension = os.path.splitext(entry)
