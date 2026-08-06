@@ -11,6 +11,10 @@ import bpy
 # Mesh attribute holding the normals exactly as they were read from the MDL
 ORIGINAL_NORMAL_ATTRIBUTE = "sr2_normal"
 
+# Collection property holding the MDL-to-Blender axis conversion of an import,
+# flattened row by row. Export reads it back to undo the same conversion.
+AXIS_CONVERSION_PROPERTY = "SR2MDL axis conversion"
+
 # How far a normal may drift from the imported one before it counts as edited
 # by the user. Blender's custom normal storage is lossy - it normalizes the
 # vectors and quantizes them per corner - so an untouched mesh comes back with
@@ -1185,17 +1189,25 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     bl_mesh = bpy.context.object.data
 
     # Apply Transforms
-    bl_obj.matrix_local = nodeTransformToMatrix(node.transform)
+    bl_obj.matrix_local = global_matrix @ nodeTransformToMatrix(node.transform)
 
     turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh)
 
-    # Switch to Object Mode and Applying Parent of Node Transform
-    bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
-    inv_mtx = mathutils.Matrix.inverted(global_matrix)
-    bpy.context.object.matrix_world = inv_mtx @ bpy.context.object.matrix_world
-
 
 def load(filepath: str, global_matrix: mathutils.Matrix):
+    """
+    Read a MDL into a new collection.
+
+    global_matrix converts MDL space into Blender space. A MDL is Y-up while
+    Blender is Z-up, so without one the model comes in lying on its back. It
+    is stored on the collection, because export has to undo exactly the same
+    conversion no matter which axes the model was brought in with.
+    """
+    # Creating objects while in Edit Mode would leave the mesh data locked
+    active_object = bpy.context.view_layer.objects.active
+    if active_object is not None and active_object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
+
     # Unpack the model, then make Blender object(s) out of it
     SR2_model = SR2MDL()
     SR2_model.unpack_from_file(filepath)
@@ -1211,6 +1223,9 @@ def load(filepath: str, global_matrix: mathutils.Matrix):
 
     # Attach file header as collection property to support saving
     model_collection["SR2MDL file header"] = SR2_model.file_header
+
+    # Remember how the axes were converted, so export can undo it
+    model_collection[AXIS_CONVERSION_PROPERTY] = [value for row in global_matrix for value in row]
 
     # Turn every node into a blender object and attach mesh to it, if present
     # (nodes without a mesh can appear anywhere in the list, not just at the
@@ -1237,8 +1252,7 @@ def load(filepath: str, global_matrix: mathutils.Matrix):
             # leaving the empty at the origin makes export write that back.
             # Applied to matrix_local rather than matrix_world, which reads
             # back as identity until the depsgraph has caught up.
-            bl_obj.matrix_local = (mathutils.Matrix.inverted(global_matrix)
-                                   @ nodeTransformToMatrix(node.transform))
+            bl_obj.matrix_local = global_matrix @ nodeTransformToMatrix(node.transform)
 
 
 def isSR2MDLcollection(blender_collection):
@@ -1409,9 +1423,28 @@ def save(output_folder_path: str):
         saveCollection(sr2_collection, output_folder_path + sr2_collection.name + ".mdl repack")
 
 
+def collectionAxisConversion(sr2_collection) -> mathutils.Matrix:
+    """
+    The MDL-to-Blender conversion the collection was imported with.
+
+    Collections from before this was recorded, and any built by hand, are
+    treated as unconverted so they keep exporting the way they used to.
+    """
+    stored_matrix = sr2_collection.get(AXIS_CONVERSION_PROPERTY)
+
+    if stored_matrix is None or len(stored_matrix) != 16:
+        return mathutils.Matrix()
+
+    values = list(stored_matrix)
+    return mathutils.Matrix([values[row * 4:row * 4 + 4] for row in range(4)])
+
+
 def saveCollection(sr2_collection, output_file_path: str):
     """ Collect all data from one collection, fill a SR2MDL with it and write it out """
     prepareSceneForSaving()
+
+    # Objects sit in Blender space, node transforms have to go back into MDL space
+    to_mdl_space = mathutils.Matrix.inverted(collectionAxisConversion(sr2_collection))
 
     SR2_model = SR2MDL()
 
@@ -1432,8 +1465,10 @@ def saveCollection(sr2_collection, output_file_path: str):
         # rotation is quantized to 16 bits per axis, and decomposing a
         # matrix returns Euler angles in a canonical range that need not be
         # the ones the file was written with.
-        if not matrixIsUnchanged(bl_object.matrix_local, nodeTransformToMatrix(new_node.transform)):
-            position, rotation, scale = bl_object.matrix_local.decompose()
+        node_matrix = to_mdl_space @ bl_object.matrix_local
+
+        if not matrixIsUnchanged(node_matrix, nodeTransformToMatrix(new_node.transform)):
+            position, rotation, scale = node_matrix.decompose()
 
             new_node.transform["Position X"] = position[0]
             new_node.transform["Position Y"] = position[1]
