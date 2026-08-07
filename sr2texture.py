@@ -190,26 +190,15 @@ def findCarTextureFile(folder: str, file_name: str):
     """
     A car texture of the folder, by the name the game knows it under.
 
-    Files pulled out of an archive can keep the path they came from in their
-    name, arriving as something like "D+-share-TXB-celica_txb-body.txr", so
-    the end of the name counts as a match too - as long as what comes before
-    it is a separator rather than more of a word, or "body" would pick up a
-    file called "nobody".
+    Matched without regard to case, because the names come out of the game as
+    they were typed - EFFECT holds WINDOW.TXR and blur.txr side by side.
     """
     wanted = file_name.lower()
 
     for entry in sorted(os.listdir(folder)):
         stem, extension = os.path.splitext(entry)
 
-        if extension.lower() not in LOWERCASE_TEXTURE_EXTENSIONS:
-            continue
-
-        stem = stem.lower()
-
-        if stem == wanted:
-            return os.path.join(folder, entry)
-
-        if stem.endswith(wanted) and not stem[-len(wanted) - 1].isalnum():
+        if extension.lower() in LOWERCASE_TEXTURE_EXTENSIONS and stem.lower() == wanted:
             return os.path.join(folder, entry)
 
     return None
