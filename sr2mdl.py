@@ -232,8 +232,8 @@ SR2MDL_node_transform = {
 }
 
 SR2MDL_node_relation = {
-    "Parent Offset": 0,
     "Child Offset": 0,
+    "Sibling Offset": 0,
     "unk_0x08": 0,
     "unk_0x0C ": 0,
 
@@ -527,8 +527,8 @@ SR2Node_extra = {
         "Offset": 0,
         "Relation Offset": 0,
         "Index": 0,
-        "Parent Index": -1,
-        "Child Index": -1
+        "Child Index": -1,
+        "Sibling Index": -1
 }
 
 
@@ -764,16 +764,16 @@ class SR2MDL:
 
         self.unpack_road_segments_from_bytes(model_file_bytes, road_offset, road_count)
 
-        # Read Node that Road references
-        # Then Mesh that Node references
+        # A road does not point at a single node but at the head of a chain -
+        # its siblings are the other pieces of scenery standing on that stretch
+        # of track. Following only the head left most of a level behind: 120 of
+        # RIVIERA.DAT's 628 nodes, 437 of DES_SS1.DAT's 902. Roads share nodes
+        # as well, so the same offset must not be read twice.
+        unpacked_node_offsets = set()
+
         for road in self.roads:
-            node_offset = road.road["Node Offset"]
-            node_offset_lod = road.road["Node Offset LOD"]
-
-            self.unpack_node_by_offset(model_file_bytes, node_offset)
-
-            if node_offset_lod != 0:
-                self.unpack_node_by_offset(model_file_bytes, node_offset_lod)
+            for node_offset in (road.road["Node Offset"], road.road["Node Offset LOD"]):
+                self.unpack_node_chain_by_offset(model_file_bytes, node_offset, unpacked_node_offsets)
 
         node_indexes_offset = road_offset + road_size_in_bytes * road_count
         self.unpack_node_indexes_from_bytes(model_file_bytes, node_indexes_offset, self.file_header["Node Indexes Size In Bytes"])
@@ -784,21 +784,51 @@ class SR2MDL:
         embedded_textures_offset = kinda_pointer_offset + self.file_header["Kinda Pointers Count"] * 32
         self.unpack_embedded_textures_from_bytes(model_file_bytes, embedded_textures_offset)
 
-    def unpack_node_by_offset(self, model_file_bytes, node_offset):
-        node_bytes = model_file_bytes[node_offset:
-                                      node_offset + 0x80]
+    def unpack_node_chain_by_offset(self, model_file_bytes, node_offset, unpacked_node_offsets):
+        """
+        Unpack a node and everything hanging off it.
 
+        A node's relation holds the offset of its first child at 0x00 and of
+        its next sibling at 0x04 - see docs/mdl_node_pointer_memo.md.
+        """
+        pending = [node_offset]
+
+        while pending:
+            offset = pending.pop()
+
+            if offset <= 0 or offset + 0x80 > len(model_file_bytes) or offset in unpacked_node_offsets:
+                continue
+
+            unpacked_node_offsets.add(offset)
+
+            node = self.unpack_node_by_offset(model_file_bytes, offset)
+
+            pending.append(node.relation["Sibling Offset"])
+            pending.append(node.relation["Child Offset"])
+
+    def unpack_node_by_offset(self, model_file_bytes, node_offset):
         new_node = SR2Node()
-        new_node.unpack_from_bytes(node_bytes)
+        new_node.unpack_from_bytes(model_file_bytes[node_offset:node_offset + 0x80])
+
+        new_node.extra["Offset"] = node_offset
+        new_node.extra["Relation Offset"] = node_offset + new_node.node_transform_size
 
         self.nodes.append(new_node)
 
-        new_mesh = Mesh()
+        # Same as for a car model - a node either describes a mesh or points at
+        # a Some Data block, and reading the one as the other gives nonsense
+        if node_has_mesh_data(model_file_bytes, new_node):
+            new_mesh = Mesh()
+            new_mesh.unpack_from_bytes(model_file_bytes, new_node.transform["Model Pointers Offset"])
 
-        new_mesh.unpack_from_bytes(model_file_bytes, new_node.transform["Model Pointers Offset"])
+            new_node.mesh = new_mesh
+            self.meshes.append(new_mesh)
+        else:
+            some_data = SomeData()
+            some_data.unpack_from_bytes(model_file_bytes, new_node.transform["Model Pointers Offset"])
+            new_node.some_data = some_data.data
 
-        new_node.mesh = new_mesh
-        self.meshes.append(new_mesh)
+        return new_node
 
     def unpack_from_bytes(self, model_file_bytes):
         self.fill_file_header_from_bytes(model_file_bytes[:self.file_header_size])
@@ -864,8 +894,8 @@ class SR2MDL:
             # and the node array that aren't accounted for by the size bookkeeping
             # below, so bytes_left is not guaranteed to reach exactly 0 once this
             # node is processed. Stop here instead of reading past the real data.
-            is_last_node = (node.relation["Parent Offset"] == 0
-                             and node.relation["Child Offset"] == 0)
+            is_last_node = (node.relation["Child Offset"] == 0
+                             and node.relation["Sibling Offset"] == 0)
 
             # Go back through the file
             current_node_relation_offset -= node_size
@@ -907,8 +937,8 @@ class SR2MDL:
         for node in self.nodes:
             print("\n")
             print("Node Index", node.transform["Node Index"])
-            print("Parent Index", node.extra["Parent Index"])
             print("Child Index", node.extra["Child Index"])
+            print("Sibling Index", node.extra["Sibling Index"])
 
     def find_node_index_relations_by_node_relation_offsets(self):
         # Find Node parent and sibling by index for easy offset calculation
@@ -916,15 +946,15 @@ class SR2MDL:
         for node_index, node in enumerate(self.nodes):
             for check_node_index, check_node in enumerate(self.nodes):
                 print("\n")
-                print("Parent Offset {0:X}".format(self.nodes[node_index].relation["Parent Offset"]))
-                print("Child Offset {0:#X}".format(self.nodes[node_index].relation["Child Offset"]))
+                print("Child Offset {0:X}".format(self.nodes[node_index].relation["Child Offset"]))
+                print("Sibling Offset {0:#X}".format(self.nodes[node_index].relation["Sibling Offset"]))
                 print("Check Node offset {0:#X}".format(check_node.extra["Offset"]))
-
-                if check_node.extra["Offset"] == self.nodes[node_index].relation["Parent Offset"]:
-                    self.nodes[node_index].extra["Parent Index"] = check_node_index
 
                 if check_node.extra["Offset"] == self.nodes[node_index].relation["Child Offset"]:
                     self.nodes[node_index].extra["Child Index"] = check_node_index
+
+                if check_node.extra["Offset"] == self.nodes[node_index].relation["Sibling Offset"]:
+                    self.nodes[node_index].extra["Sibling Index"] = check_node_index
 
     def unpack_from_file(self, file_path):
         with open(file_path, "r+b") as file:
@@ -1058,25 +1088,25 @@ class SR2MDL:
         for node in self.nodes:
             print("Updating offsets for Node", node.transform["Node Index"], "with offset", node.extra["Offset"])
 
-            parent_index = node.extra["Parent Index"]
-            print("Parent Node index", parent_index)
-
-            if node.extra["Parent Index"] != -1:
-                print("Previous Parent Offset", node.relation["Parent Offset"])
-
-                node.relation["Parent Offset"] = self.nodes[parent_index].extra["Offset"]
-
-                print("New Parent offset", node.relation["Parent Offset"])
-
             child_index = node.extra["Child Index"]
             print("Child Node index", child_index)
 
-            if node.extra["Child Index"] != -1:
-                print("Previous Child Offset", self.nodes[child_index].extra["Offset"])
+            if child_index != -1:
+                print("Previous Child Offset", node.relation["Child Offset"])
 
                 node.relation["Child Offset"] = self.nodes[child_index].extra["Offset"]
 
                 print("New Child offset", node.relation["Child Offset"])
+
+            sibling_index = node.extra["Sibling Index"]
+            print("Sibling Node index", sibling_index)
+
+            if sibling_index != -1:
+                print("Previous Sibling Offset", node.relation["Sibling Offset"])
+
+                node.relation["Sibling Offset"] = self.nodes[sibling_index].extra["Offset"]
+
+                print("New Sibling offset", node.relation["Sibling Offset"])
 
     def pack_file_header(self):
         return struct.pack(self.file_header_formatting, *self.file_header.values())
@@ -1606,7 +1636,11 @@ def saveCollection(sr2_collection, output_file_path: str):
             new_node.transform["Scale Y"] = scale[1]
             new_node.transform["Scale Z"] = scale[2]
 
-        new_node.relation = bl_object["Node Relation"]
+        # The two offsets used to be called Parent and Child before it was clear
+        # they are the first child and the next sibling. Objects imported back
+        # then still carry the old names; the values and their order are the same
+        new_node.relation = dict(zip(SR2MDL_node_relation.keys(),
+                                     bl_object["Node Relation"].to_dict().values()))
 
         if bl_object.get("Extra"):
             new_node.extra = bl_object["Extra"]
