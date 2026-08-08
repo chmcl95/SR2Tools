@@ -29,6 +29,10 @@ AXIS_CONVERSION_PROPERTY = "SR2MDL axis conversion"
 # be edited from the Material tab. Registered by the add-on, see __init__.py
 MATERIAL_PROPERTY = "sr2_mdl_material"
 
+# Object property holding the 0x20 block a mesh's Model Pointers "unk_0x18"
+# points at, for the meshes that have one
+EXTRA_BLOCK_PROPERTY = "Model Extra Block"
+
 # The material fields, in the order they are packed
 MATERIAL_COLOR_0_KEYS = ("R0", "G0", "B0", "A0")
 MATERIAL_COLOR_1_KEYS = ("R1", "G1", "B1", "A1")
@@ -310,7 +314,12 @@ class Mesh:
     format_face = '<{0}h'
     format_model_pointers = '<8I'
     draw_options_format = '<2I' + '4f' + '2I'
-    
+
+    # The block a mesh's Model Pointers "unk_0x18" points at, read as raw
+    # 32-bit words so any bit pattern comes back out the way it went in
+    extra_block_format = '<8i'
+    extra_block_size = 0x20
+
     def __init__(self):
         self.offset = 0
         self.total_size = 0
@@ -321,11 +330,16 @@ class Mesh:
         self.model_pointers = {}
         self.draw_options = {}
 
+        # None when the mesh has no such block, which is all but 73 of the
+        # 3810 meshes of the sample files - see unpack_extra_block_from_bytes
+        self.extra_block = None
+
         # Used for packing
         self.sizes = {
             "Material": 0x20,
             "Vertex": 0,
             "Face": 0,
+            "ExtraBlock": 0,
             "ModelPointers": 0x20,
             "DrawOptions": 0x20
         }
@@ -338,10 +352,13 @@ class Mesh:
         if face_size % 32 != 0:
             face_size = (((face_size//32) + 1) * 32)
 
+        extra_block_size = self.extra_block_size if self.extra_block is not None else 0
+
         self.sizes["Vertex"] = vertex_size
         self.sizes["Face"] = face_size
+        self.sizes["ExtraBlock"] = extra_block_size
 
-        self.total_size = 0x20 + vertex_size + face_size + 0x20 + 0x20
+        self.total_size = 0x20 + vertex_size + face_size + extra_block_size + 0x20 + 0x20
 
     """ Unpacking """
 
@@ -403,11 +420,41 @@ class Mesh:
                                                                draw_option_bytes,
                                                                self.draw_options_format)
 
+    def unpack_extra_block_from_bytes(self, full_model_file_bytes, model_pointer_offset):
+        """
+        Read the 0x20 block sitting between the faces and the Model Pointers.
+
+        "unk_0x18" holds its offset when there is one. Telling that apart from
+        the small number the field otherwise carries is exact: over the 3810
+        meshes of the sample files it either equals Model Pointers - 0x20 (73
+        meshes, all of them the four-vertex light billboards of a car) or is
+        far too small to be an offset at all (the other 3737). Nothing lands in
+        between, and in all 73 the block starts the moment the face data ends.
+
+        Every one of the 73 holds the same eight floats, 0.0 and 1.0 four times
+        over - a pair per vertex of the quad. What they mean is still open, so
+        the bytes are kept as they are and written back untouched. Dropping
+        them used to shift everything behind the mesh and change the offsets in
+        the node array of 29 sample files.
+        """
+        extra_block_offset = self.model_pointers["unk_0x18"]
+
+        if extra_block_offset != model_pointer_offset - self.extra_block_size:
+            return
+
+        if extra_block_offset < 0 or extra_block_offset + self.extra_block_size > len(full_model_file_bytes):
+            return
+
+        self.extra_block = list(struct.unpack_from(self.extra_block_format,
+                                                   full_model_file_bytes,
+                                                   extra_block_offset))
+
     def unpack_from_bytes(self, full_model_file_bytes, model_pointer_offset):
         """
         Material
         Vertex[]
         Face[]
+        ExtraBlock, when the mesh has one
         ModelPointers
         DrawOptions
         """
@@ -423,6 +470,9 @@ class Mesh:
         self.unpack_faces_from_bytes(full_model_file_bytes,
                                      self.model_pointers["Face Offset"],
                                      self.model_pointers["Face Count"])
+
+        self.unpack_extra_block_from_bytes(full_model_file_bytes, model_pointer_offset)
+
         # Unpack Draw Options
         model_pointers_size_in_bytes = 0x20
         self.unpack_draw_options_from_bytes(full_model_file_bytes,
@@ -466,12 +516,19 @@ class Mesh:
     def pack_draw_options(self):
         return struct.pack(self.draw_options_format, *self.draw_options.values())
 
+    def pack_extra_block(self) -> bytes:
+        if self.extra_block is None:
+            return b''
+
+        return struct.pack(self.extra_block_format, *self.extra_block)
+
     def pack_and_return(self):
         """
             Model
         Material
         Vertex[]
         Face[]
+        ExtraBlock, when the mesh has one
         ModelPointer
         DrawOption
         """
@@ -480,10 +537,12 @@ class Mesh:
         material_bytes = self.pack_material()
         vertex_bytes = self.pack_vertexes()
         faces_bytes = self.pack_faces()
+        extra_block_bytes = self.pack_extra_block()
         model_pointers_bytes = self.pack_model_pointers()
         draw_options_bytes = self.pack_draw_options()
 
-        return material_bytes + vertex_bytes + faces_bytes + model_pointers_bytes + draw_options_bytes
+        return (material_bytes + vertex_bytes + faces_bytes + extra_block_bytes
+                + model_pointers_bytes + draw_options_bytes)
 
 
 some_data = {
@@ -1015,6 +1074,12 @@ class SR2MDL:
             mesh.model_pointers["Face Offset"] = current_mesh_offset + mesh.sizes["Material"] + mesh.sizes["Vertex"]
             mesh.model_pointers["Material Offset"] = current_mesh_offset
 
+            # The extra block follows the faces, so its offset moves with them.
+            # A mesh without one keeps whatever small number the field held
+            if mesh.extra_block is not None:
+                mesh.model_pointers["unk_0x18"] = (current_mesh_offset + mesh.sizes["Material"]
+                                                   + mesh.sizes["Vertex"] + mesh.sizes["Face"])
+
             current_mesh_offset += mesh.total_size
 
     def update_node_offset_to_model_pointers(self):
@@ -1031,7 +1096,8 @@ class SR2MDL:
                 mesh = node.mesh
 
                 node.transform["Model Pointers Offset"] = (mesh.offset + mesh.sizes["Material"]
-                                                           + mesh.sizes["Vertex"] + mesh.sizes["Face"])
+                                                           + mesh.sizes["Vertex"] + mesh.sizes["Face"]
+                                                           + mesh.sizes["ExtraBlock"])
                 node.transform["Draw Options Offset"] = node.transform["Model Pointers Offset"] + 0x20
             elif node.some_data != {}:
                 # A mesh-less node points at its Some Data instead. Leaving the
@@ -1305,6 +1371,11 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     # Attach all of this to bl_obj instead of bl_mesh to allow copying mesh from other places
     bl_obj["Model Pointers"] = model_mesh.model_pointers
     bl_obj["Draw Options"] = model_mesh.draw_options
+
+    # Only the light billboards have one. Kept as raw 32-bit words so it can be
+    # written back unchanged - see Mesh.unpack_extra_block_from_bytes
+    if model_mesh.extra_block is not None:
+        bl_obj[EXTRA_BLOCK_PROPERTY] = model_mesh.extra_block
 
     # The material goes on the mesh, where Blender expects it, so it can be
     # edited from the Material tab and follows the mesh when it gets copied
@@ -1724,6 +1795,13 @@ def saveCollection(sr2_collection, output_file_path: str):
             SR2_mesh.model_pointers["Face Count"] = len(SR2_mesh.faces)
 
             SR2_mesh.draw_options = bl_object["Draw Options"]
+
+            # Written back between the faces and the Model Pointers, where it
+            # came from. Its offset is recalculated on the way out, so it stays
+            # right even when the mesh in front of it changed size
+            extra_block = bl_object.get(EXTRA_BLOCK_PROPERTY)
+            if extra_block is not None and len(extra_block) == 8:
+                SR2_mesh.extra_block = list(extra_block)
 
             new_node.mesh = SR2_mesh
             SR2_model.meshes.append(SR2_mesh)
