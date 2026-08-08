@@ -775,6 +775,8 @@ class SR2MDL:
             for node_offset in (road.road["Node Offset"], road.road["Node Offset LOD"]):
                 self.unpack_node_chain_by_offset(model_file_bytes, node_offset, unpacked_node_offsets)
 
+        self.find_node_index_relations_by_node_relation_offsets()
+
         node_indexes_offset = road_offset + road_size_in_bytes * road_count
         self.unpack_node_indexes_from_bytes(model_file_bytes, node_indexes_offset, self.file_header["Node Indexes Size In Bytes"])
 
@@ -941,20 +943,16 @@ class SR2MDL:
             print("Sibling Index", node.extra["Sibling Index"])
 
     def find_node_index_relations_by_node_relation_offsets(self):
-        # Find Node parent and sibling by index for easy offset calculation
+        # Find Node child and sibling by index for easy offset calculation.
+        # A level has over a thousand nodes, so this looks the offsets up in a
+        # dict rather than comparing every node against every other one
         print("\nFinding Relationships between Nodes")
-        for node_index, node in enumerate(self.nodes):
-            for check_node_index, check_node in enumerate(self.nodes):
-                print("\n")
-                print("Child Offset {0:X}".format(self.nodes[node_index].relation["Child Offset"]))
-                print("Sibling Offset {0:#X}".format(self.nodes[node_index].relation["Sibling Offset"]))
-                print("Check Node offset {0:#X}".format(check_node.extra["Offset"]))
 
-                if check_node.extra["Offset"] == self.nodes[node_index].relation["Child Offset"]:
-                    self.nodes[node_index].extra["Child Index"] = check_node_index
+        index_by_offset = {node.extra["Offset"]: index for index, node in enumerate(self.nodes)}
 
-                if check_node.extra["Offset"] == self.nodes[node_index].relation["Sibling Offset"]:
-                    self.nodes[node_index].extra["Sibling Index"] = check_node_index
+        for node in self.nodes:
+            node.extra["Child Index"] = index_by_offset.get(node.relation["Child Offset"], -1)
+            node.extra["Sibling Index"] = index_by_offset.get(node.relation["Sibling Offset"], -1)
 
     def unpack_from_file(self, file_path):
         with open(file_path, "r+b") as file:
@@ -1321,10 +1319,48 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     bl_obj.select_set(True)
     bl_mesh = bpy.context.object.data
 
-    # Apply Transforms
+    # Apply Transforms. A node that turns out to have a parent gets this
+    # redone without the axis conversion - see parentBlenderObjectsByNodeRelation
     bl_obj.matrix_local = global_matrix @ nodeTransformToMatrix(node.transform)
 
     turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh)
+
+    return bl_obj
+
+
+def parentBlenderObjectsByNodeRelation(nodes, blender_objects):
+    """
+    Hang every object off the node that owns it.
+
+    A node's relation names its first child, and that child's sibling chain
+    holds the rest of them. The game draws a child through its parent's
+    transform: DES_SS1/cp_4.mdl stores node_0001 at the origin, and in game it
+    stands wherever node_0000 stands and turns with it. Leaving the objects
+    flat put such a node at the world origin instead.
+
+    A parented object's matrix_local is relative to its parent, which is
+    exactly what a node transform holds, so the transform goes on unchanged.
+    The axis conversion belongs to the root objects alone - applying it to a
+    child as well would apply it once per level of the hierarchy.
+    """
+    already_parented = set()
+
+    for node, bl_object in zip(nodes, blender_objects):
+        child_index = node.extra["Child Index"]
+
+        while 0 <= child_index < len(blender_objects) and child_index not in already_parented:
+            already_parented.add(child_index)
+
+            child_object = blender_objects[child_index]
+            child_object.parent = bl_object
+
+            # Without this Blender keeps the child where it is on screen by
+            # remembering the offset here, and then the node transform below
+            # would be applied on top of that
+            child_object.matrix_parent_inverse = mathutils.Matrix()
+            child_object.matrix_local = nodeTransformToMatrix(nodes[child_index].transform)
+
+            child_index = nodes[child_index].extra["Sibling Index"]
 
 
 def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = True):
@@ -1369,6 +1405,8 @@ def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = T
     # (nodes without a mesh can appear anywhere in the list, not just at the
     # end, so the node<->mesh association set during unpack must be used
     # instead of comparing indexes against len(SR2_model.meshes))
+    blender_objects = []
+
     for index, node in enumerate(SR2_model.nodes):
         if node.mesh is not None:
             texture_index = node.transform["Texture Index"]
@@ -1380,7 +1418,8 @@ def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = T
                 print("!!! Node {} wants texture {}, which the texture file does not have !!!".format(
                     index, texture_index))
 
-            generate_mesh(node, node.mesh, index, global_matrix, model_collection, blender_image)
+            blender_objects.append(generate_mesh(node, node.mesh, index, global_matrix,
+                                                 model_collection, blender_image))
         else:
             node_name = 'node_{0:04}'.format(index)
             bl_obj = bpy.data.objects.new(node_name, None)
@@ -1400,6 +1439,12 @@ def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = T
             # Applied to matrix_local rather than matrix_world, which reads
             # back as identity until the depsgraph has caught up.
             bl_obj.matrix_local = global_matrix @ nodeTransformToMatrix(node.transform)
+
+            blender_objects.append(bl_obj)
+
+    # Done once every object exists, because a node can name a child that
+    # comes later in the list
+    parentBlenderObjectsByNodeRelation(SR2_model.nodes, blender_objects)
 
 
 def isSR2MDLcollection(blender_collection):
@@ -1618,7 +1663,13 @@ def saveCollection(sr2_collection, output_file_path: str):
         # rotation is quantized to 16 bits per axis, and decomposing a
         # matrix returns Euler angles in a canonical range that need not be
         # the ones the file was written with.
-        node_matrix = to_mdl_space @ bl_object.matrix_local
+        # A child's matrix_local is relative to its parent, the same way a node
+        # transform is, so it goes back as it stands. Only a root carries the
+        # axis conversion that has to be undone here
+        if bl_object.parent is None:
+            node_matrix = to_mdl_space @ bl_object.matrix_local
+        else:
+            node_matrix = bl_object.matrix_local.copy()
 
         if not matrixIsUnchanged(node_matrix, nodeTransformToMatrix(new_node.transform)):
             position, rotation, scale = node_matrix.decompose()
