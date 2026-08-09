@@ -33,6 +33,13 @@ MATERIAL_PROPERTY = "sr2_mdl_material"
 # points at, for the meshes that have one
 EXTRA_BLOCK_PROPERTY = "Model Extra Block"
 
+# Object properties holding a mesh's face data exactly as it was read, and the
+# shape of the Blender mesh built from it. Export puts the bytes back when the
+# topology still matches, because not every mesh stores its faces the way this
+# tool writes them - see Mesh.unpack_faces_from_bytes
+ORIGINAL_FACE_PROPERTY = "Original Face Data"
+ORIGINAL_TOPOLOGY_PROPERTY = "Original Topology"
+
 # The material fields, in the order they are packed
 MATERIAL_COLOR_0_KEYS = ("R0", "G0", "B0", "A0")
 MATERIAL_COLOR_1_KEYS = ("R1", "G1", "B1", "A1")
@@ -334,6 +341,10 @@ class Mesh:
         # 3810 meshes of the sample files - see unpack_extra_block_from_bytes
         self.extra_block = None
 
+        # The face region as it was read, padding and all. Written back
+        # untouched when the user did not change the topology
+        self.original_face_bytes = None
+
         # Used for packing
         self.sizes = {
             "Material": 0x20,
@@ -348,9 +359,12 @@ class Mesh:
         vertex_size = len(self.vertexes) * 4 * 8
 
         # Add padding to face size, so it would be aligned to 32-bytes
-        face_size = len(self.faces) * 2
-        if face_size % 32 != 0:
-            face_size = (((face_size//32) + 1) * 32)
+        if self.original_face_bytes is not None:
+            face_size = len(self.original_face_bytes)
+        else:
+            face_size = len(self.faces) * 2
+            if face_size % 32 != 0:
+                face_size = (((face_size//32) + 1) * 32)
 
         extra_block_size = self.extra_block_size if self.extra_block is not None else 0
 
@@ -400,6 +414,31 @@ class Mesh:
 
         fmt_faces = self.format_face.format(face_count)
         self.faces = struct.unpack_from(fmt_faces, face_bytes, 0)
+
+        # Keep the region as it stands when writing the indices back out would
+        # not reproduce it.
+        #
+        # "Face Count" is an index count for the usual mesh, always a multiple
+        # of three, and those survive the trip through Blender unchanged. 98
+        # meshes of the sample files hold 1 instead, every one of them a
+        # four-vertex billboard, and their region is four 32-bit indices - 3,
+        # 2, 1, 0 or 1, 0, 3, 2 - sometimes followed by a 1.0 or -1.0. What
+        # picks one encoding over the other is not worked out yet.
+        #
+        # Import turns such a mesh into a Blender quad, and writing that back
+        # as six 16-bit indices with a Face Count of 6 froze the game on the
+        # car light models. Putting the original bytes back avoids guessing.
+        padded_size = face_count * 2
+        if padded_size % 32 != 0:
+            padded_size = ((padded_size // 32) + 1) * 32
+
+        if face_offset <= 0 or face_offset + padded_size > len(full_model_file_bytes):
+            return
+
+        region = full_model_file_bytes[face_offset:face_offset + padded_size]
+
+        if region != self.pack_faces():
+            self.original_face_bytes = region
 
     def unpack_model_pointers_from_bytes(self, full_model_file_bytes, model_pointer_offset):
         model_pointers_size_in_bytes = 0x20
@@ -496,6 +535,11 @@ class Mesh:
         return vertex_bytes
 
     def pack_faces(self) -> bytes:
+        # An untouched mesh goes back exactly as it came in, whatever encoding
+        # its faces were in - see unpack_faces_from_bytes
+        if self.original_face_bytes is not None:
+            return bytes(self.original_face_bytes)
+
         # Faces need to be packed with 32-byte alignment
         face_format_with_amount = self.format_face.format(len(self.faces))
         face_bytes = struct.pack(face_format_with_amount, *self.faces)
@@ -1203,6 +1247,18 @@ class SR2MDL:
         new_file.close()
 
 
+def meshTopology(blender_mesh) -> list:
+    """
+    Counts that change the moment the faces of a mesh do.
+
+    Moving a vertex leaves all three alone, which is what makes it usable as
+    "the face data on file still describes this mesh". Re-triangulating without
+    touching any count would slip through, but nothing short of storing every
+    index would catch that, and the file only gains from being left alone.
+    """
+    return [len(blender_mesh.vertices), len(blender_mesh.polygons), len(blender_mesh.loops)]
+
+
 def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
     temp_blender_mesh = bmesh.new()
 
@@ -1395,6 +1451,12 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
     bl_obj.matrix_local = global_matrix @ nodeTransformToMatrix(node.transform)
 
     turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh)
+
+    # Recorded after the Blender mesh exists, so export can tell whether the
+    # topology is still the one these bytes describe
+    if model_mesh.original_face_bytes is not None:
+        bl_obj[ORIGINAL_FACE_PROPERTY] = list(model_mesh.original_face_bytes)
+        bl_obj[ORIGINAL_TOPOLOGY_PROPERTY] = meshTopology(bl_mesh)
 
     return bl_obj
 
@@ -1789,10 +1851,29 @@ def saveCollection(sr2_collection, output_file_path: str):
                 raise ValueError("{} has {} vertices, more than the {} a MDL mesh can index"
                                  .format(bl_object.name, len(SR2_mesh.vertexes), 0x7FFF))
 
-            SR2_mesh.model_pointers = bl_object["Model Pointers"]
+            # Copied, not referenced. Assigning the property itself made every
+            # recalculated offset and count below write straight back into the
+            # Blender object, so a second export saw the first one's numbers
+            # Copied, not referenced. Assigning the property itself made every
+            # recalculated offset and count below write straight back into the
+            # Blender object, so a second export saw the first one's numbers
+            SR2_mesh.model_pointers = dict(bl_object["Model Pointers"].to_dict())
+            original_face_count = SR2_mesh.model_pointers["Face Count"]
+
             SR2_mesh.model_pointers["Vertex Count"] = len(SR2_mesh.vertexes)
             # Counts indices, not triangles - a 525 triangle mesh stores 1575 here
             SR2_mesh.model_pointers["Face Count"] = len(SR2_mesh.faces)
+
+            # A mesh whose faces are untouched goes back byte for byte, keeping
+            # whatever Face Count and encoding the file used. Rewriting those
+            # as triangles froze the game on the car light models
+            original_faces = bl_object.get(ORIGINAL_FACE_PROPERTY)
+            original_topology = bl_object.get(ORIGINAL_TOPOLOGY_PROPERTY)
+
+            if (original_faces is not None and original_topology is not None
+                    and list(original_topology) == meshTopology(blender_mesh)):
+                SR2_mesh.original_face_bytes = bytes(list(original_faces))
+                SR2_mesh.model_pointers["Face Count"] = original_face_count
 
             SR2_mesh.draw_options = bl_object["Draw Options"]
 
