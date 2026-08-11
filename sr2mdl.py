@@ -21,6 +21,10 @@ NO_TEXTURE_INDEX = -1
 # Mesh attribute holding the normals exactly as they were read from the MDL
 ORIGINAL_NORMAL_ATTRIBUTE = "sr2_normal"
 
+# Mesh attribute holding the UVs exactly as they were read from the MDL, before
+# the V flip that import applies
+ORIGINAL_UV_ATTRIBUTE = "sr2_uv"
+
 # Collection property holding the MDL-to-Blender axis conversion of an import,
 # flattened row by row. Export reads it back to undo the same conversion.
 AXIS_CONVERSION_PROPERTY = "SR2MDL axis conversion"
@@ -53,6 +57,11 @@ MATERIAL_FLOAT_KEYS = ("unk_0x08", "unk_0x0C", "unk_0x10", "unk_0x14", "unk_0x18
 # and up to 0.005 on 4.3 and 5.0. 0.05 is roughly 3 degrees, well below any
 # deliberate edit.
 NORMAL_EDITED_THRESHOLD = 0.05
+
+# How far a UV may drift from the imported one before it counts as edited.
+# Import flips V and export flips it back, which is exact on paper but not in
+# single precision, and a texture cares about nothing this small anyway.
+UV_EDITED_THRESHOLD = 1e-5
 
 # A node's rotation is three unsigned 16-bit values. Import has always read
 # them as pi/0x7FFF radians per unit, which puts a full turn at 0xFFFE, so that
@@ -1267,11 +1276,13 @@ def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
 
     normals = []
     uvs = []
+    original_uvs = []
 
     for vertex in model_mesh.vertexes:
         bl_vertex = temp_blender_mesh.verts.new(vertex.position)
         bl_vertex_array.append(bl_vertex)
         normals.append(vertex.normal)
+        original_uvs.append(list(vertex.uv))
         #flip V-coordinate
         flipped_v = -(vertex.uv[1] - 1.0)
         flipped_uv = [ vertex.uv[0], flipped_v ]
@@ -1332,6 +1343,14 @@ def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
                                             type='FLOAT_VECTOR',
                                             domain='POINT')
     stored_normals.data.foreach_set("vector", [value for normal in normals for value in normal])
+
+    # Same for the UVs, which import flips and export flips back. A FLOAT_VECTOR
+    # for a pair of numbers wastes a float per vertex, but it is the one type
+    # this already relies on working the same way on every supported Blender
+    stored_uvs = bl_mesh.attributes.new(name=ORIGINAL_UV_ATTRIBUTE,
+                                        type='FLOAT_VECTOR',
+                                        domain='POINT')
+    stored_uvs.data.foreach_set("vector", [value for uv in original_uvs for value in (uv[0], uv[1], 0.0)])
 
 
 def colorComponentToByte(component: float) -> int:
@@ -1662,6 +1681,40 @@ def getOriginalNormals(blender_mesh):
     return [flat_normals[i:i + 3] for i in range(0, len(flat_normals), 3)]
 
 
+def getOriginalUVs(blender_mesh):
+    """ UVs as they were read from the file, or None if they aren't available """
+    stored_uvs = blender_mesh.attributes.get(ORIGINAL_UV_ATTRIBUTE)
+
+    if stored_uvs is None or stored_uvs.domain != 'POINT':
+        return None
+
+    if len(stored_uvs.data) != len(blender_mesh.vertices):
+        return None
+
+    flat_uvs = [0.0] * (len(blender_mesh.vertices) * 3)
+    stored_uvs.data.foreach_get("vector", flat_uvs)
+
+    return [flat_uvs[i:i + 2] for i in range(0, len(flat_uvs), 3)]
+
+
+def uvIsUnchanged(original_uv, new_uv) -> bool:
+    """
+    Whether a UV still holds what the file had.
+
+    A coordinate that is not a number cannot be shown or edited, the same way a
+    NaN normal cannot - the light billboards of a car store one in U - so it
+    counts as untouched rather than as a mismatch that never resolves.
+    """
+    for axis in (0, 1):
+        if not math.isfinite(original_uv[axis]):
+            continue
+
+        if abs(original_uv[axis] - new_uv[axis]) > UV_EDITED_THRESHOLD:
+            return False
+
+    return True
+
+
 def convertBlenderFacesToSR2Faces(blender_mesh):
     """
     Flat array of triangle vertex indices.
@@ -1737,10 +1790,20 @@ def convertBlenderVertexesToSR2Vertexes(blender_mesh):
         vertexes.append(SR2_vertex)
 
     # UVs
+    original_uvs = getOriginalUVs(blender_mesh)
+
     for i, loop in enumerate(blender_mesh.loops):
         fliped_uv = [blender_mesh.uv_layers["uv0"].data[i].uv[0], blender_mesh.uv_layers["uv0"].data[i].uv[1]]
         # flip V-coordinate
         fliped_uv[1] = -(fliped_uv[1] - 1.0)
+
+        # An untouched UV goes back exactly as it was read. Flipping V in and
+        # out again is exact on paper, but a V of 0.0 comes back as -0.0 -
+        # negating what the first flip turned into a plain 1.0 - and rounding
+        # through Blender's single precision storage can move the last bit.
+        if original_uvs is not None and uvIsUnchanged(original_uvs[loop.vertex_index], fliped_uv):
+            fliped_uv = list(original_uvs[loop.vertex_index])
+
         vertexes[loop.vertex_index].uv = fliped_uv
 
     return vertexes
