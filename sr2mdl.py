@@ -1627,6 +1627,25 @@ def getCornerNormals(blender_mesh):
     return [mathutils.Vector(loop.normal) for loop in blender_mesh.loops]
 
 
+def normalCanBeCompared(normal) -> bool:
+    """
+    Whether a normal read from a MDL is one Blender can be asked about.
+
+    Blender normalizes a custom normal, so a zero-length one comes back as
+    whatever the faces say and a non-finite one comes back as a default. The
+    value in the file never reaches the user in either case, which means the
+    user cannot have edited it and it should go back untouched.
+
+    Both happen. tree_a.mdl through tree_f.mdl zero the normals of four
+    vertices each, and Char/A.MDL and Char/Z.MDL store 0, NaN, 0 for every
+    vertex they have.
+    """
+    if not all(math.isfinite(component) for component in normal):
+        return False
+
+    return mathutils.Vector(normal).length > 0.0
+
+
 def getOriginalNormals(blender_mesh):
     """ Normals as they were imported, or None if they aren't available """
     stored_normals = blender_mesh.attributes.get(ORIGINAL_NORMAL_ATTRIBUTE)
@@ -1704,7 +1723,11 @@ def convertBlenderVertexesToSR2Vertexes(blender_mesh):
         if original_normals is not None:
             original_normal = mathutils.Vector(original_normals[vertex_index])
 
-            if original_normal.length > 0.0:
+            if not normalCanBeCompared(original_normals[vertex_index]):
+                # Nothing to compare against - Blender replaced this one on the
+                # way in, so the file's value is the only one there ever was
+                SR2_vertex.normal = list(original_normals[vertex_index])
+            else:
                 difference = max(abs(component)
                                  for component in (original_normal.normalized() - blender_normal))
 
