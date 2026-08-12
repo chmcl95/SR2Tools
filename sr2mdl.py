@@ -37,12 +37,22 @@ MATERIAL_PROPERTY = "sr2_mdl_material"
 # points at, for the meshes that have one
 EXTRA_BLOCK_PROPERTY = "Model Extra Block"
 
-# Object properties holding a mesh's face data exactly as it was read, and the
-# shape of the Blender mesh built from it. Export puts the bytes back when the
-# topology still matches, because not every mesh stores its faces the way this
-# tool writes them - see Mesh.unpack_faces_from_bytes
+# Object property holding a mesh's face data exactly as it was read, for the
+# meshes that do not store their faces the way this tool writes them - see
+# Mesh.unpack_faces_from_bytes
 ORIGINAL_FACE_PROPERTY = "Original Face Data"
-ORIGINAL_TOPOLOGY_PROPERTY = "Original Topology"
+
+# Object property marking a mesh whose faces are written from the bytes above
+# instead of from the Blender mesh. Import sets it on the meshes that need it;
+# clearing it from the object's Custom Properties hands the mesh back to the
+# usual triangle path, and setting it by hand makes a mesh built in Blender
+# come out in the billboard encoding
+FIXED_FACE_PROPERTY = "Fixed Face Data"
+
+# What a flagged mesh writes when it has no bytes of its own - one face of four
+# 32-bit indices, the form every four-vertex billboard of the sample files uses
+DEFAULT_FIXED_FACE_DATA = struct.pack('<4i', 3, 2, 1, 0) + bytes(0x10)
+DEFAULT_FIXED_FACE_COUNT = 1
 
 # The material fields, in the order they are packed
 MATERIAL_COLOR_0_KEYS = ("R0", "G0", "B0", "A0")
@@ -1256,16 +1266,33 @@ class SR2MDL:
         new_file.close()
 
 
-def meshTopology(blender_mesh) -> list:
+def meshUsesFixedFaceData(bl_object) -> bool:
     """
-    Counts that change the moment the faces of a mesh do.
+    Whether this object's faces are written from the file's bytes.
 
-    Moving a vertex leaves all three alone, which is what makes it usable as
-    "the face data on file still describes this mesh". Re-triangulating without
-    touching any count would slip through, but nothing short of storing every
-    index would catch that, and the file only gains from being left alone.
+    Import sets the flag on every mesh whose face data would not survive being
+    rebuilt from the Blender mesh. Deciding it from the flag rather than from
+    the shape of the mesh keeps editing one predictable: the encoding holds
+    until the user says otherwise, instead of falling back to the triangles
+    that froze the game the moment a vertex is added.
     """
-    return [len(blender_mesh.vertices), len(blender_mesh.polygons), len(blender_mesh.loops)]
+    flag = bl_object.get(FIXED_FACE_PROPERTY)
+
+    if flag is not None:
+        return bool(flag)
+
+    # Imported before the flag existed, where keeping the bytes meant the same
+    return bl_object.get(ORIGINAL_FACE_PROPERTY) is not None
+
+
+def fixedFaceData(bl_object, stored_face_count):
+    """ The face bytes and Face Count a flagged object writes """
+    stored = bl_object.get(ORIGINAL_FACE_PROPERTY)
+
+    if stored is None:
+        return DEFAULT_FIXED_FACE_DATA, DEFAULT_FIXED_FACE_COUNT
+
+    return bytes(list(stored)), stored_face_count
 
 
 def turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh):
@@ -1471,11 +1498,11 @@ def generate_mesh(node: SR2Node, model_mesh: Mesh, index: int, global_matrix: ma
 
     turnSR2MeshIntoBlenderMesh(model_mesh, bl_mesh)
 
-    # Recorded after the Blender mesh exists, so export can tell whether the
-    # topology is still the one these bytes describe
+    # Flagged here rather than worked out at export time, so the encoding is
+    # something the user can see on the object and turn off
     if model_mesh.original_face_bytes is not None:
         bl_obj[ORIGINAL_FACE_PROPERTY] = list(model_mesh.original_face_bytes)
-        bl_obj[ORIGINAL_TOPOLOGY_PROPERTY] = meshTopology(bl_mesh)
+        bl_obj[FIXED_FACE_PROPERTY] = True
 
     return bl_obj
 
@@ -1940,9 +1967,6 @@ def saveCollection(sr2_collection, output_file_path: str):
             # Copied, not referenced. Assigning the property itself made every
             # recalculated offset and count below write straight back into the
             # Blender object, so a second export saw the first one's numbers
-            # Copied, not referenced. Assigning the property itself made every
-            # recalculated offset and count below write straight back into the
-            # Blender object, so a second export saw the first one's numbers
             SR2_mesh.model_pointers = dict(bl_object["Model Pointers"].to_dict())
             original_face_count = SR2_mesh.model_pointers["Face Count"]
 
@@ -1950,16 +1974,11 @@ def saveCollection(sr2_collection, output_file_path: str):
             # Counts indices, not triangles - a 525 triangle mesh stores 1575 here
             SR2_mesh.model_pointers["Face Count"] = len(SR2_mesh.faces)
 
-            # A mesh whose faces are untouched goes back byte for byte, keeping
-            # whatever Face Count and encoding the file used. Rewriting those
-            # as triangles froze the game on the car light models
-            original_faces = bl_object.get(ORIGINAL_FACE_PROPERTY)
-            original_topology = bl_object.get(ORIGINAL_TOPOLOGY_PROPERTY)
-
-            if (original_faces is not None and original_topology is not None
-                    and list(original_topology) == meshTopology(blender_mesh)):
-                SR2_mesh.original_face_bytes = bytes(list(original_faces))
-                SR2_mesh.model_pointers["Face Count"] = original_face_count
+            # A flagged mesh keeps the encoding the file used, edited or not.
+            # Writing one of these as triangles froze the game on the car light
+            # models, and the flag is the only thing that knows the difference
+            if meshUsesFixedFaceData(bl_object):
+                SR2_mesh.original_face_bytes, SR2_mesh.model_pointers["Face Count"] =                     fixedFaceData(bl_object, original_face_count)
 
             SR2_mesh.draw_options = bl_object["Draw Options"]
 
