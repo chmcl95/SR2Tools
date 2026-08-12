@@ -164,7 +164,10 @@ SR2MDL_file_header_dict = {
     "Relation Offset": 0,
     "Road count": 0,
 
-    "Node Indexes Size In Bytes": 0,
+    # Counts the indexes, not the bytes they take. Reading it as a byte size
+    # made the array a quarter of its real length and put everything behind it
+    # at the wrong offset - see unpack_node_indexes_from_bytes
+    "Node Indexes Count": 0,
     "Kinda Pointers Count": 0,
     "Unk4": 0,
     "Unk5": 0,
@@ -277,9 +280,11 @@ SR2MDL_Road = {
     "Index": 0,
     "Node Offset": 0,
     "Node Offset LOD": 0,
-    "Unk_3": 0,
+    # Where this road's slice of the level's node index array starts, and how
+    # many entries it has. The slices are contiguous and in road order
+    "Node Index Count": 0,
 
-    "Unk_4": 0,
+    "Node Index Start": 0,
     "Unk_5": 0,
     "Unk_6": 0,
     "Unk_7": 0,
@@ -793,23 +798,37 @@ class SR2MDL:
 
             self.roads.append(new_road)
 
-    def unpack_node_indexes_from_bytes(self, model_file_bytes, offset, node_indexes_size):
-        single_index_size = 4
-        node_indexes_count = node_indexes_size // single_index_size
+    def unpack_node_indexes_from_bytes(self, model_file_bytes, offset, node_indexes_count):
+        """
+        The level's node index array: one slice of road indexes per road.
 
-        # "Node Indexes Size In Bytes" is not always a multiple of 4 (seen in
-        # RIVIERA.DAT: 0x9E = 158 bytes), so only slice the bytes that make up
-        # whole indexes here; unpack_level_model_from_bytes still advances to
-        # the next section by the raw header value, since that's the real
-        # physical stride and any trailing bytes are just unparsed padding.
-        aligned_size = node_indexes_count * single_index_size
+        Each road says where its slice starts and how long it is, at 0x10 and
+        0x0C of the road. The slices run back to back in road order and the
+        last one ends exactly on the header's count, in all four sample levels.
 
+        A slice holds other roads, never its own index, never a duplicate, and
+        always in ascending order - so it reads as the set of road segments
+        that matter while driving this one. How many that is tracks how far one
+        can see: RIVIERA averages 2.6 of them, the desert of DES_SS1 15.2.
+
+        The header field counts indexes rather than bytes. Taking it for a byte
+        size read a quarter of the array and left every section behind it -
+        the kinda pointers, the embedded textures - starting mid-array. It also
+        explains RIVIERA's count of 158 looking like a size that is not a
+        multiple of four.
+        """
         node_indexes_bytes = model_file_bytes[offset:
-                                              offset + aligned_size]
+                                              offset + node_indexes_count * 4]
 
         node_indexes_formated = self.node_indexes_format.format(node_indexes_count)
 
         self.node_indexes = struct.unpack(node_indexes_formated, node_indexes_bytes)
+
+    def node_indexes_of_road(self, road):
+        """ The slice of the node index array belonging to one road """
+        start = road.road["Node Index Start"]
+
+        return self.node_indexes[start:start + road.road["Node Index Count"]]
 
     def unpack_kinda_pointers_from_bytes(self, model_file_bytes, offset, kinda_pointers_count):
         """
@@ -900,9 +919,11 @@ class SR2MDL:
         self.find_node_index_relations_by_node_relation_offsets()
 
         node_indexes_offset = road_offset + road_size_in_bytes * road_count
-        self.unpack_node_indexes_from_bytes(model_file_bytes, node_indexes_offset, self.file_header["Node Indexes Size In Bytes"])
+        node_indexes_count = self.file_header["Node Indexes Count"]
 
-        kinda_pointer_offset = node_indexes_offset + self.file_header["Node Indexes Size In Bytes"]
+        self.unpack_node_indexes_from_bytes(model_file_bytes, node_indexes_offset, node_indexes_count)
+
+        kinda_pointer_offset = node_indexes_offset + node_indexes_count * 4
         self.unpack_kinda_pointers_from_bytes(model_file_bytes, kinda_pointer_offset, self.file_header["Kinda Pointers Count"])
 
         embedded_textures_offset = kinda_pointer_offset + self.file_header["Kinda Pointers Count"] * 32
