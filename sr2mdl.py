@@ -168,7 +168,9 @@ SR2MDL_file_header_dict = {
     # made the array a quarter of its real length and put everything behind it
     # at the wrong offset - see unpack_node_indexes_from_bytes
     "Node Indexes Count": 0,
-    "Kinda Pointers Count": 0,
+    # One record per triangle of the level, each naming the three beside it.
+    # Was "Kinda Pointers Count" - see unpack_triangle_links_from_bytes
+    "Triangle Link Count": 0,
     "Unk4": 0,
     "Unk5": 0,
 }
@@ -311,16 +313,19 @@ SR2MDL_Road = {
 }
 
 
-SR2MDL_kinda_pointers = {
-    "Unk_0": 0,
-    "Unk_1": 0,
-    "Unk_2": 0,
-    "Unk_3": 0,
+# One record per triangle of a level, holding the three triangles beside it.
+# Called "kinda pointers" before the shape of it was clear - see
+# SR2MDL.unpack_triangle_links_from_bytes
+SR2MDL_triangle_link = {
+    "Vertex Base": 0,
+    "Face Offset": 0,
+    "Neighbour 0": 0,
+    "Neighbour 1": 0,
 
-    "Unk_4": 0,
-    "Unk_5": 0,
-    "Unk_6": 0,
-    "Unk_7": 0,
+    "Neighbour 2": 0,
+    "unk_0x14": 0,
+    "Flags": 0,
+    "unk_0x1C": 0,
 }
 
 
@@ -756,7 +761,7 @@ class SR2RoadSegment:
 
 class SR2MDL:
     node_indexes_format = "<{}I"
-    kinda_pointers_format = "<8I"
+    triangle_link_format = "<7I" + "1f"
 
     def __init__(self):
         self.file_header = dict.copy(SR2MDL_file_header_dict)
@@ -773,7 +778,7 @@ class SR2MDL:
         # Which nodes hang off each road, filled for a level - see
         # find_road_node_indexes
         self.road_node_indexes = []
-        self.kinda_pointers = []
+        self.triangle_links = []
         self.embedded_textures = []
 
         self.embedded_textures_bytes = []
@@ -834,31 +839,52 @@ class SR2MDL:
 
         return self.node_indexes[start:start + road.road["Node Index Count"]]
 
-    def unpack_kinda_pointers_from_bytes(self, model_file_bytes, offset, kinda_pointers_count):
+    def unpack_triangle_links_from_bytes(self, model_file_bytes, offset, triangle_link_count):
         """
-        Seem to come in groups
+        One 0x20 record per triangle of the level, naming its three neighbours.
 
-        1 value - Pointer to vertex array of a Mesh
-        2 value - Pointer to start of face array of the same Mesh
+        The guess this was named for - "kinda pointers" - had the first two
+        right. 0x00 is the vertex array of a mesh and 0x04 the offset of this
+        triangle's three 16-bit indices inside that mesh's faces. Records
+        sharing a 0x00 have 0x04 running in an unbroken +6 chain: 122 of
+        RIVIERA's 122 groups, 512 of DES_SS1's 527.
 
-        4 value - A node index? Just index?
+        0x08, 0x0C and 0x10 index back into this same array, and the links are
+        symmetric - if a record names another, that other names it back. Over
+        the four levels that holds for 173,032 of 173,040 links, so the array
+        is the adjacency of a triangle mesh.
 
-        Next in the same group
-        1 value - same pointer as before
-        2 value - same pointer as before, but slightly larger. Doesn't seem to point to something correctly. Doesn't make sense
+        Record 0 is all zeros and stands for "no neighbour".
+
+        Left open:
+
+        - 0x18 is a small set of flag values per level. Its top bit splits the
+          records into two pools that never share a 0x00 between them, and
+          every record in the top-bit pool has 0x1C exactly 1.0 while almost
+          none of the others do.
+        - 0x1C is a float no greater than 1.0. For RIVIERA it is the absolute Y
+          of the triangle's normal in 4195 of the 5177 records that could be
+          checked, matching to a median of 0.00002 - too close to be chance -
+          but the same test on the other levels mostly misses, so where those
+          read their vertices from is not pinned down.
+        - 0x14 is 0 in all 59,685 records of all four levels.
         """
+        record_size = struct.calcsize(self.triangle_link_format)
 
-        single_kinda_pointers_size = struct.calcsize(self.kinda_pointers_format)
+        for index in range(triangle_link_count):
+            record_offset = offset + index * record_size
 
-        kinda_pointers_offset = offset
-        for i in range(kinda_pointers_count):
-            kinda_pointers_bytes = model_file_bytes[kinda_pointers_offset:
-                                                    kinda_pointers_offset + single_kinda_pointers_size]
+            self.triangle_links.append(
+                fill_dict_from_bytes_by_formatting(
+                    SR2MDL_triangle_link,
+                    model_file_bytes[record_offset:record_offset + record_size],
+                    self.triangle_link_format))
 
-            unpacked_kinda_pointers = struct.unpack(self.kinda_pointers_format, kinda_pointers_bytes)
-            self.kinda_pointers.append(unpacked_kinda_pointers)
+    def neighbours_of_triangle_link(self, index):
+        """ The records beside one, leaving out the null record 0 stands for """
+        link = self.triangle_links[index]
 
-            kinda_pointers_offset += single_kinda_pointers_size
+        return [link[key] for key in ("Neighbour 0", "Neighbour 1", "Neighbour 2") if link[key] != 0]
 
     def unpack_embedded_textures_from_bytes(self, model_file_bytes, starting_offset):
         # Split by their sizes, actual texture handling should be carried by texture classes
@@ -928,10 +954,12 @@ class SR2MDL:
 
         self.unpack_node_indexes_from_bytes(model_file_bytes, node_indexes_offset, node_indexes_count)
 
-        kinda_pointer_offset = node_indexes_offset + node_indexes_count * 4
-        self.unpack_kinda_pointers_from_bytes(model_file_bytes, kinda_pointer_offset, self.file_header["Kinda Pointers Count"])
+        triangle_link_offset = node_indexes_offset + node_indexes_count * 4
+        triangle_link_count = self.file_header["Triangle Link Count"]
 
-        embedded_textures_offset = kinda_pointer_offset + self.file_header["Kinda Pointers Count"] * 32
+        self.unpack_triangle_links_from_bytes(model_file_bytes, triangle_link_offset, triangle_link_count)
+
+        embedded_textures_offset = triangle_link_offset + triangle_link_count * 32
         self.unpack_embedded_textures_from_bytes(model_file_bytes, embedded_textures_offset)
 
     def find_road_node_indexes(self):
