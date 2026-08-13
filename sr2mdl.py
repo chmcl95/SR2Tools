@@ -769,6 +769,10 @@ class SR2MDL:
         # Present in level files
         self.roads = []
         self.node_indexes = []
+
+        # Which nodes hang off each road, filled for a level - see
+        # find_road_node_indexes
+        self.road_node_indexes = []
         self.kinda_pointers = []
         self.embedded_textures = []
 
@@ -917,6 +921,7 @@ class SR2MDL:
                 self.unpack_node_chain_by_offset(model_file_bytes, node_offset, unpacked_node_offsets)
 
         self.find_node_index_relations_by_node_relation_offsets()
+        self.find_road_node_indexes()
 
         node_indexes_offset = road_offset + road_size_in_bytes * road_count
         node_indexes_count = self.file_header["Node Indexes Count"]
@@ -928,6 +933,41 @@ class SR2MDL:
 
         embedded_textures_offset = kinda_pointer_offset + self.file_header["Kinda Pointers Count"] * 32
         self.unpack_embedded_textures_from_bytes(model_file_bytes, embedded_textures_offset)
+
+    def find_road_node_indexes(self):
+        """
+        Which nodes hang off each road.
+
+        Walked over the nodes already unpacked rather than during unpacking,
+        because roads share nodes: the walk there stops at anything an earlier
+        road reached first, which is right for reading each node once and wrong
+        for asking what a given road holds. 468 of DES_SS1's 902 nodes are
+        reached by more than one road.
+        """
+        index_by_offset = {node.extra["Offset"]: index for index, node in enumerate(self.nodes)}
+
+        self.road_node_indexes = []
+
+        for road in self.roads:
+            found = []
+            seen = set()
+            pending = [road.road["Node Offset"], road.road["Node Offset LOD"]]
+
+            while pending:
+                offset = pending.pop()
+                node_index = index_by_offset.get(offset)
+
+                if node_index is None or offset in seen:
+                    continue
+
+                seen.add(offset)
+                found.append(node_index)
+
+                relation = self.nodes[node_index].relation
+                pending.append(relation["Sibling Offset"])
+                pending.append(relation["Child Offset"])
+
+            self.road_node_indexes.append(found)
 
     def unpack_node_chain_by_offset(self, model_file_bytes, node_offset, unpacked_node_offsets):
         """
@@ -1563,7 +1603,45 @@ def parentBlenderObjectsByNodeRelation(nodes, blender_objects):
             child_index = nodes[child_index].extra["Sibling Index"]
 
 
-def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = True):
+def groupBlenderObjectsByRoad(sr2_model, blender_objects, model_collection):
+    """
+    Put a level's objects into one collection per road.
+
+    A road carries the scenery standing on its stretch of track. Keeping the
+    objects one to a road rather than one to a visible set leaves the node
+    index array - which says what else is worth drawing from there - as a
+    relationship to follow between collections instead of something duplicated
+    into them.
+
+    A node reached by more than one road is linked into each of them, which
+    Blender is happy to do.
+    """
+    grouped = False
+
+    for road_index, node_indexes in enumerate(sr2_model.road_node_indexes):
+        if not node_indexes:
+            continue
+
+        road_collection = bpy.data.collections.new(name="road_{0:04}".format(road_index))
+        model_collection.children.link(road_collection)
+
+        for node_index in node_indexes:
+            if 0 <= node_index < len(blender_objects):
+                road_collection.objects.link(blender_objects[node_index])
+                grouped = True
+
+    if not grouped:
+        return
+
+    # Anything that found a road no longer needs to sit loose in the level
+    # collection as well
+    for bl_object in blender_objects:
+        if len(bl_object.users_collection) > 1:
+            model_collection.objects.unlink(bl_object)
+
+
+def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = True,
+         group_by_road: bool = False):
     """
     Read a MDL into a new collection.
 
@@ -1573,6 +1651,9 @@ def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = T
     conversion no matter which axes the model was brought in with.
 
     load_textures picks up the texture file next to the model, if there is one.
+
+    group_by_road splits a level into one collection per road. A plain model
+    has no roads and is unaffected.
     """
     # Creating objects while in Edit Mode would leave the mesh data locked
     active_object = bpy.context.view_layer.objects.active
@@ -1645,6 +1726,10 @@ def load(filepath: str, global_matrix: mathutils.Matrix, load_textures: bool = T
     # Done once every object exists, because a node can name a child that
     # comes later in the list
     parentBlenderObjectsByNodeRelation(SR2_model.nodes, blender_objects)
+
+    # Only a level has roads to group by
+    if group_by_road and SR2_model.road_node_indexes:
+        groupBlenderObjectsByRoad(SR2_model, blender_objects, model_collection)
 
 
 def isSR2MDLcollection(blender_collection):
